@@ -951,9 +951,6 @@ pub const Viewer = struct {
         actions: *std.ArrayList(Action),
         content: []const u8,
     ) !void {
-        // If there is an error, reset our actions to what it was before.
-        errdefer actions.shrinkRetainingCapacity(actions.items.len);
-
         // This stores our new window state from this list-windows output.
         var windows: std.ArrayList(Window) = .empty;
         defer windows.deinit(self.alloc);
@@ -996,12 +993,15 @@ pub const Viewer = struct {
             });
         }
 
-        // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
-
         // Sync up our layouts. This will populate unknown panes, prune, etc.
+        // This moves the windows above into our own window list, so it must
+        // happen before we build the action below.
         try self.syncLayouts(windows.items);
+
+        // Setup our windows action so the caller can process GUI
+        // window changes. This has to reference our own window list: the
+        // local list above only owns the slice until we return.
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
     }
 
     fn receivedPaneState(
@@ -2657,6 +2657,48 @@ test "write before startup completes is dropped" {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
                     try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
+
+test "list-windows windows action outlives the parse" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 42,
+            .name = "main",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                ,
+            } },
+            .contains_tags = &.{.windows},
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    const windows = for (actions) |action| {
+                        if (action == .windows) break action.windows;
+                    } else return error.WindowsActionMissing;
+
+                    // The action must point at our own window list. Anything
+                    // else is freed by the time we return to the caller.
+                    try testing.expectEqual(
+                        @intFromPtr(v.windows.items.ptr),
+                        @intFromPtr(windows.ptr),
+                    );
+                    try testing.expectEqual(v.windows.items.len, windows.len);
+
+                    try testing.expectEqual(1, windows.len);
+                    try testing.expectEqual(0, windows[0].id);
+                    try testing.expectEqual(83, windows[0].width);
+                    try testing.expectEqual(44, windows[0].height);
                 }
             }).check,
         },
