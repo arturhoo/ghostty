@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -418,6 +419,12 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// Set when this surface displays a tmux control mode pane rather
+    /// than running a process. Holds a router reference, released when
+    /// the surface is torn down.
+    tmux: if (terminal.options.tmux_control_mode) ?termio.Tmux.Pane else void =
+        if (terminal.options.tmux_control_mode) null else {},
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -463,7 +470,26 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Display a tmux control mode pane instead of running a
+        /// command. The router comes from `ghostty_surface_tmux_router`
+        /// on the surface hosting the session, and the reference it
+        /// returns is consumed by the surface created here.
+        ///
+        /// When this is set, `command`, `initial_input` and the
+        /// environment above are all ignored: there is no process.
+        tmux_router: ?*anyopaque = null,
+        tmux_pane_id: usize = 0,
     };
+
+    /// The tmux pane this surface displays, if it was created for one.
+    ///
+    /// Named to match the accessor the core looks for; runtimes that
+    /// cannot host tmux panes simply do not have it.
+    pub fn tmuxPane(self: *Surface) ?termio.Tmux.Pane {
+        if (comptime !terminal.options.tmux_control_mode) return null;
+        return self.tmux;
+    }
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         self.* = .{
@@ -477,6 +503,16 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .tmux = if (comptime terminal.options.tmux_control_mode) tmux: {
+                const router = opts.tmux_router orelse break :tmux null;
+                break :tmux .{
+                    .router = @ptrCast(@alignCast(router)),
+                    .pane_id = opts.tmux_pane_id,
+                };
+            } else {},
+        };
+        errdefer if (comptime terminal.options.tmux_control_mode) {
+            if (self.tmux) |t| t.router.unref();
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -607,6 +643,15 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+
+        // Our router reference outlives the core surface, which took its
+        // own for the backend.
+        if (comptime terminal.options.tmux_control_mode) {
+            if (self.tmux) |t| {
+                t.router.unref();
+                self.tmux = null;
+            }
+        }
     }
 
     /// Initialize the inspector instance. A surface can only have one
@@ -1530,6 +1575,22 @@ pub const CAPI = struct {
     /// Returns initial surface options.
     export fn ghostty_surface_config_new() apprt.Surface.Options {
         return .{};
+    }
+
+    /// The tmux control mode router for a surface hosting a session,
+    /// or null. The caller owns the returned reference.
+    export fn ghostty_surface_tmux_router(surface: *Surface) ?*anyopaque {
+        if (comptime !terminal.options.tmux_control_mode) return null;
+        return surface.core_surface.tmuxRouter();
+    }
+
+    /// Release a reference from ghostty_surface_tmux_router that was not
+    /// handed to a surface config.
+    export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {
+        if (comptime !terminal.options.tmux_control_mode) return;
+        const router = router_ orelse return;
+        const r: *terminal.tmux.Router = @ptrCast(@alignCast(router));
+        r.unref();
     }
 
     /// Create a new surface as part of an app.

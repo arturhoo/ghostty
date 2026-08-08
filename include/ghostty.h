@@ -477,6 +477,16 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+
+  // Display a tmux control mode pane instead of running a command.
+  // Obtain the router from ghostty_surface_tmux_router on the surface
+  // hosting the session; the reference it returns is consumed by the
+  // surface created with this config.
+  //
+  // When set, command, initial_input and env_vars are ignored: a tmux
+  // pane has no process of its own.
+  void* tmux_router;
+  size_t tmux_pane_id;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1151,6 +1161,13 @@ GHOSTTY_API bool ghostty_app_has_global_keybinds(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_scheme_e);
 
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
+
+// Returns the tmux control mode router for a surface hosting a session,
+// or NULL. The caller owns the returned reference and must release it
+// with ghostty_tmux_router_free, or hand it to exactly one surface
+// config, which consumes it.
+GHOSTTY_API void* ghostty_surface_tmux_router(ghostty_surface_t);
+GHOSTTY_API void ghostty_tmux_router_free(void*);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
