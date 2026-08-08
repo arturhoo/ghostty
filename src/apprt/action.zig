@@ -354,6 +354,11 @@ pub const Action = union(Key) {
     /// Move a tab to a new window.
     move_tab_to_new_window,
 
+    /// The tmux control mode window and pane layout changed. This is the
+    /// full set of windows, not a delta; the receiver diffs it against
+    /// whatever it built last time.
+    tmux_windows: TmuxWindows,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -424,6 +429,7 @@ pub const Action = union(Key) {
         readonly,
         copy_title_to_clipboard,
         move_tab_to_new_window,
+        tmux_windows,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -1030,6 +1036,37 @@ pub const SearchTotal = struct {
         return .{
             .total = if (self.total) |t| @intCast(t) else -1,
         };
+    }
+};
+
+/// The tmux control mode window and pane layout.
+///
+/// Each window carries its layout tree flattened into an array of nodes,
+/// where a split addresses its children as a half-open range into that
+/// same array. See `terminal.tmux.WindowSet`.
+///
+/// The windows are only valid for the duration of the action callback.
+pub const TmuxWindows = struct {
+    windows: []const terminal.tmux.WindowSet.Window,
+
+    // Sync with: ghostty_action_tmux_windows_s
+    pub const C = extern struct {
+        windows: [*]const terminal.tmux.WindowSet.Window,
+        len: usize,
+    };
+
+    pub fn cval(self: TmuxWindows) C {
+        return .{
+            .windows = self.windows.ptr,
+            .len = self.windows.len,
+        };
+    }
+
+    test "ghostty.h TmuxWindows.Node.Kind" {
+        try lib.checkGhosttyHEnum(
+            terminal.tmux.WindowSet.Node.Kind,
+            "GHOSTTY_TMUX_NODE_",
+        );
     }
 };
 
