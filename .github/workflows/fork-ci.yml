@@ -47,22 +47,19 @@ jobs:
         with:
           version: ${{ steps.zig.outputs.version }}
 
-      # Mirrors the apt package set from src/build/docker/debian/Dockerfile
-      # (see also Dockerfile.toolchain used to validate this workflow
-      # locally). libonig-dev matters: the build fails without it.
+      # Subset of src/build/docker/debian/Dockerfile's apt packages: the GTK
+      # ones are omitted because we build with -Dapp-runtime=none (and
+      # libgtk4-layer-shell-dev is not packaged for ubuntu-latest anyway).
+      # libonig-dev matters: the build fails without it.
       - name: Install system dependencies
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq -y --no-install-recommends install \
-            blueprint-compiler \
             build-essential \
             libbz2-dev \
             libonig-dev \
             libxml2-utils \
-            pandoc \
-            libadwaita-1-dev \
-            libgtk-4-dev \
-            libgtk4-layer-shell-dev
+            pandoc
 
       - name: zig fmt
         run: zig fmt --check .
