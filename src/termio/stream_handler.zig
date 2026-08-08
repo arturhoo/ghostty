@@ -73,6 +73,15 @@ pub const StreamHandler = struct {
     /// control mode session. This is an owned reference.
     tmux_router: if (tmux_enabled) ?*terminal.tmux.Router else void = if (tmux_enabled) null else {},
 
+    /// The termio we belong to, so the router can ask it to talk to tmux.
+    tmux_host: if (tmux_enabled) *termio.Termio else void,
+
+    /// Set when a pane could not be attached because its parser was part
+    /// way through an escape sequence. We try again on the next
+    /// notification; the sequence completes at latest with the pane's next
+    /// `%output`, and something mid-sequence is by definition mid-stream.
+    tmux_attach_retry: if (tmux_enabled) bool else void = if (tmux_enabled) false else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
@@ -90,11 +99,60 @@ pub const StreamHandler = struct {
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
-        if (comptime tmux_enabled) tmux: {
-            const viewer = self.tmux_viewer orelse break :tmux;
-            viewer.deinit();
-            self.alloc.destroy(viewer);
-            self.tmux_viewer = null;
+        if (comptime tmux_enabled) {
+            if (self.tmux_viewer) |viewer| {
+                viewer.deinit();
+                self.alloc.destroy(viewer);
+                self.tmux_viewer = null;
+            }
+
+            // Any pane still holding a reference keeps this alive until
+            // it lets go.
+            if (self.tmux_router) |r| {
+                r.unref();
+                self.tmux_router = null;
+            }
+        }
+    }
+
+    /// Give every pane we know about a channel on the router, so its
+    /// operations are captured from now on.
+    ///
+    /// Runs on the io thread with the renderer mutex held, and touches
+    /// only viewer state and router bookkeeping, so it takes no lock that
+    /// could block.
+    fn tmuxAttachPanes(
+        self: *StreamHandler,
+        viewer: *terminal.tmux.Viewer,
+    ) void {
+        if (comptime !tmux_enabled) return;
+
+        const router = self.tmux_router orelse return;
+        self.tmux_attach_retry = false;
+
+        var it = viewer.panes.iterator();
+        while (it.next()) |kv| {
+            const pane_id = kv.key_ptr.*;
+            if (!router.needsChannel(pane_id)) continue;
+
+            const sink = router.createChannel(pane_id) catch {
+                log.warn(
+                    "failed to make a channel for tmux pane id={}",
+                    .{pane_id},
+                );
+                continue;
+            };
+
+            viewer.attachPane(pane_id, sink) catch |err| {
+                router.destroyChannel(pane_id);
+                switch (err) {
+                    // The pane is part way through an escape sequence.
+                    // It will be back in ground state by its next output
+                    // at the latest, so try again then.
+                    error.PaneMidSequence => self.tmux_attach_retry = true,
+                    error.UnknownPane => {},
+                }
+            };
         }
     }
 
@@ -400,6 +458,21 @@ pub const StreamHandler = struct {
                         errdefer self.alloc.destroy(viewer);
                         viewer.* = try .init(global.io(), self.alloc);
                         errdefer viewer.deinit();
+
+                        // One router per host surface, kept across
+                        // sessions: its channels are per session and are
+                        // all closed when a session ends.
+                        if (self.tmux_router == null) {
+                            self.tmux_router = try .create(
+                                self.alloc,
+                                global.io(),
+                                .{
+                                    .ctx = self.tmux_host,
+                                    .vtable = &termio.Termio.tmux_host_vtable,
+                                },
+                            );
+                        }
+
                         self.tmux_viewer = viewer;
                         break :tmux;
                     },
@@ -454,6 +527,14 @@ pub const StreamHandler = struct {
                         },
 
                         .windows => |windows| windows: {
+                            // Claim a channel for every pane we now know
+                            // about, before anyone outside can learn the
+                            // pane ids. Attaching this early is what makes
+                            // the initial capture replay reach the pane's
+                            // display: those captures are queued before
+                            // this action is emitted, so their replies
+                            // arrive after we are attached.
+                            self.tmuxAttachPanes(viewer);
                             // The action's memory belongs to the viewer's
                             // arena and dies on the next call to next, so
                             // the surface gets a snapshot that owns itself.
@@ -475,6 +556,10 @@ pub const StreamHandler = struct {
                         },
                     }
                 }
+
+                // A pane we could not attach last time because it was
+                // mid-sequence may be back in ground state now.
+                if (self.tmux_attach_retry) self.tmuxAttachPanes(viewer);
             },
 
             .xtgettcap => |*gettcap| {
