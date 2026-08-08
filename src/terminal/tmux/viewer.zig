@@ -13,6 +13,8 @@ const TerminalStream = @import("../stream_terminal.zig").Stream;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
+const sinkpkg = @import("sink.zig");
+const Sink = sinkpkg.Sink;
 
 const log = std.log.scoped(.terminal_tmux_viewer);
 
@@ -288,6 +290,10 @@ pub const Viewer = struct {
         /// notification loses the prefix and prints the tail as text.
         stream: TerminalStream,
 
+        /// Where this pane's operations are mirrored, if anything has
+        /// attached. See `attachPane`.
+        sink: ?Sink = null,
+
         pub fn create(
             io: std.Io,
             alloc: Allocator,
@@ -305,11 +311,13 @@ pub const Viewer = struct {
 
             // Only valid because `self` never moves again.
             self.stream = self.terminal.vtStream();
+            self.sink = null;
 
             return self;
         }
 
         pub fn destroy(self: *Pane, alloc: Allocator) void {
+            if (self.sink) |s| s.close();
             self.stream.deinit();
             self.terminal.deinit(alloc);
             alloc.destroy(self);
@@ -1069,124 +1077,63 @@ pub const Viewer = struct {
                 log.info("received pane state for untracked pane id={}", .{data.pane_id});
                 continue;
             };
-            const pane: *Pane = entry.value_ptr.*;
-            const t: *Terminal = &pane.terminal;
 
-            // Determine which screen to use based on alternate_on
-            const screen_key: ScreenSet.Key = if (data.alternate_on) .alternate else .primary;
-
-            // Set cursor position on the appropriate screen (tmux uses 0-based)
-            if (t.screens.get(screen_key)) |screen| {
-                cursor: {
-                    const cursor_x = std.math.cast(
-                        size.CellCountInt,
-                        data.cursor_x,
-                    ) orelse break :cursor;
-                    const cursor_y = std.math.cast(
-                        size.CellCountInt,
-                        data.cursor_y,
-                    ) orelse break :cursor;
-                    if (cursor_x >= screen.pages.cols or
-                        cursor_y >= screen.pages.rows) break :cursor;
-                    screen.cursorAbsolute(cursor_x, cursor_y);
-                }
-
-                // Set cursor shape on this screen
-                if (data.cursor_shape.len > 0) {
-                    if (std.mem.eql(u8, data.cursor_shape, "block")) {
-                        screen.cursor.cursor_style = .block;
-                    } else if (std.mem.eql(u8, data.cursor_shape, "underline")) {
-                        screen.cursor.cursor_style = .underline;
-                    } else if (std.mem.eql(u8, data.cursor_shape, "bar")) {
-                        screen.cursor.cursor_style = .bar;
-                    }
-                }
-                // "default" or unknown: leave as-is
-            }
-
-            // Set alternate screen saved cursor position
-            if (t.screens.get(.alternate)) |alt_screen| cursor: {
-                const alt_x = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_x,
-                ) orelse break :cursor;
-                const alt_y = std.math.cast(
-                    size.CellCountInt,
-                    data.alternate_saved_y,
-                ) orelse break :cursor;
-
-                // If our coordinates are outside our screen we ignore it.
-                // tmux actually sends MAX_INT for when there isn't a set
-                // cursor position, so this isn't theoretical.
-                if (alt_x >= alt_screen.pages.cols or
-                    alt_y >= alt_screen.pages.rows) break :cursor;
-
-                alt_screen.cursorAbsolute(alt_x, alt_y);
-            }
-
-            // Set cursor visibility
-            t.modes.set(.cursor_visible, data.cursor_flag);
-
-            // Set cursor blinking
-            t.modes.set(.cursor_blinking, data.cursor_blinking);
-
-            // Terminal modes
-            t.modes.set(.insert, data.insert_flag);
-            t.modes.set(.wraparound, data.wrap_flag);
-            t.modes.set(.keypad_keys, data.keypad_flag);
-            t.modes.set(.cursor_keys, data.keypad_cursor_flag);
-            t.modes.set(.origin, data.origin_flag);
-
-            // Mouse modes
-            t.modes.set(.mouse_event_any, data.mouse_all_flag);
-            t.modes.set(.mouse_event_button, data.mouse_any_flag);
-            t.modes.set(.mouse_event_normal, data.mouse_button_flag);
-            t.modes.set(.mouse_event_x10, data.mouse_standard_flag);
-            t.modes.set(.mouse_format_utf8, data.mouse_utf8_flag);
-            t.modes.set(.mouse_format_sgr, data.mouse_sgr_flag);
-
-            // Focus and bracketed paste
-            t.modes.set(.focus_event, data.focus_flag);
-            t.modes.set(.bracketed_paste, data.bracketed_paste);
-
-            // Scroll region (tmux uses 0-based values)
-            scroll: {
-                const scroll_top = std.math.cast(
-                    size.CellCountInt,
-                    data.scroll_region_upper,
-                ) orelse break :scroll;
-                const scroll_bottom = std.math.cast(
-                    size.CellCountInt,
-                    data.scroll_region_lower,
-                ) orelse break :scroll;
-                t.scrolling_region.top = scroll_top;
-                t.scrolling_region.bottom = scroll_bottom;
-            }
-
-            // Tab stops - parse comma-separated list and set
-            t.tabstops.reset(0); // Clear all tabstops first
-            if (data.pane_tabs.len > 0) {
-                var tabs_it = std.mem.splitScalar(u8, data.pane_tabs, ',');
-                while (tabs_it.next()) |tab_str| {
-                    const col = std.fmt.parseInt(usize, tab_str, 10) catch continue;
-                    const col_cell = std.math.cast(size.CellCountInt, col) orelse continue;
-                    if (col_cell >= t.cols) continue;
-                    t.tabstops.set(col_cell);
-                }
-            }
-
-            // Everything above addresses screens by key, so the pane is
-            // still on whichever screen the last capture replay left
-            // active: the alternate one, since that is the last capture
-            // we queue. tmux just told us which screen the pane is
-            // really on, so put it back.
-            _ = t.switchScreen(screen_key) catch |err| {
-                log.warn(
-                    "failed to restore active screen pane id={}: {}",
-                    .{ data.pane_id, err },
-                );
-            };
+            try self.paneOps(entry.value_ptr.*, &.{.{ .pane_state = data }});
         }
+    }
+
+    /// Mirror a pane's operations somewhere else, typically a surface that
+    /// renders the pane.
+    ///
+    /// Attach while the pane's initial captures are still in flight, which
+    /// is what happens if you attach in response to a `.windows` action:
+    /// the captures are queued before that action is emitted, so their
+    /// replies reach the sink. A pane that has been alive for a while will
+    /// only mirror what happens from now on; re-capturing for a late
+    /// attacher is not implemented yet.
+    ///
+    /// An existing sink for the pane is closed and replaced.
+    pub fn attachPane(
+        self: *Viewer,
+        pane_id: usize,
+        s: Sink,
+    ) error{UnknownPane}!void {
+        const entry = self.panes.getEntry(pane_id) orelse
+            return error.UnknownPane;
+        const pane: *Pane = entry.value_ptr.*;
+        if (pane.sink) |old| old.close();
+        pane.sink = s;
+    }
+
+    /// Stop mirroring a pane. Closes the sink. Safe to call for a pane
+    /// that is unknown or has nothing attached.
+    pub fn detachPane(self: *Viewer, pane_id: usize) void {
+        const entry = self.panes.getEntry(pane_id) orelse return;
+        const pane: *Pane = entry.value_ptr.*;
+        if (pane.sink) |s| {
+            s.close();
+            pane.sink = null;
+        }
+    }
+
+    /// Apply operations to a pane's terminal and mirror them to its sink.
+    ///
+    /// Both sides see the same ops and, apart from the byte stream, run the
+    /// same `applyOp`, which is what stops the shadow terminal and the
+    /// attached one from drifting.
+    fn paneOps(
+        self: *Viewer,
+        pane: *Pane,
+        ops: []const sinkpkg.Op,
+    ) !void {
+        for (ops) |op| switch (op) {
+            // The stream is per-pane and persistent, so it can't go
+            // through applyOp.
+            .bytes => |b| pane.stream.nextSlice(b),
+            else => try sinkpkg.applyOp(self.alloc, &pane.terminal, op),
+        };
+
+        if (pane.sink) |s| s.send(ops);
     }
 
     fn receivedPaneHistory(
@@ -1201,23 +1148,19 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        const t: *Terminal = &pane.terminal;
-        _ = try t.switchScreen(screen_key);
-        const screen: *Screen = t.screens.active;
 
-        // Send the data as-is into the pane's stream. This will populate
-        // the active area too so it won't be exactly correct but we'll get
-        // the active contents soon.
-        pane.stream.nextSlice(content);
-
-        // Populate the active area to be empty since this is only history.
-        // We'll fill it with blanks and move the cursor to the top-left.
-        t.carriageReturn();
-        for (0..t.rows) |_| try t.index();
-        t.setCursorPos(1, 1);
+        // The replay populates the active area too, so it won't be exactly
+        // correct, but scrolling it into history leaves only the scrollback
+        // we were after and we'll get the active contents soon.
+        try self.paneOps(pane, &.{
+            .{ .switch_screen = screen_key },
+            .{ .bytes = content },
+            .scroll_into_history,
+        });
 
         // Our active area should be empty
         if (comptime std.debug.runtime_safety) {
+            const screen: *Screen = pane.terminal.screens.active;
             var discarding: std.Io.Writer.Discarding = .init(&.{});
             screen.dumpString(&discarding.writer, .{
                 .tl = screen.pages.getTopLeft(.active),
@@ -1239,15 +1182,14 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        const t: *Terminal = &pane.terminal;
-        _ = try t.switchScreen(screen_key);
 
         // Erase the active area and reset the cursor to the top-left
         // before writing the visible content.
-        t.eraseDisplay(.complete, false);
-        t.setCursorPos(1, 1);
-
-        pane.stream.nextSlice(content);
+        try self.paneOps(pane, &.{
+            .{ .switch_screen = screen_key },
+            .erase_and_home,
+            .{ .bytes = content },
+        });
     }
 
     fn receivedOutput(
@@ -1260,7 +1202,7 @@ pub const Viewer = struct {
             return;
         };
         const pane: *Pane = entry.value_ptr.*;
-        pane.stream.nextSlice(data);
+        try self.paneOps(pane, &.{.{ .bytes = data }});
     }
 
     /// Convert a tmux layout dimension into a terminal cell count. tmux
@@ -1319,6 +1261,14 @@ pub const Viewer = struct {
                             .cols = cols,
                             .rows = rows,
                         });
+
+                        // Anything mirroring this pane has to resize too.
+                        // A consumer that owns a surface should route this
+                        // through its surface resize path.
+                        if (pane.sink) |s| s.send(&.{.{ .resize = .{
+                            .cols = cols,
+                            .rows = rows,
+                        } }});
                     }
 
                     gop.value_ptr.* = pane;
@@ -1512,6 +1462,10 @@ const Command = union(enum) {
 };
 
 /// Format strings used for commands in our viewer.
+/// The parsed `list-panes` line for a single pane, as carried by
+/// `sink.Op.pane_state`.
+pub const PaneStateData = Format.list_panes.Struct();
+
 const Format = struct {
     /// The variables included in this format, in order.
     vars: []const output.Variable,
@@ -2642,6 +2596,134 @@ test "write before startup completes is dropped" {
     });
 }
 
+/// A sink that applies everything it receives to its own terminal, which
+/// is what a real consumer does. Init in place: the stream's handler points
+/// at `terminal`, so this must not be moved after init.
+const MirrorSink = struct {
+    alloc: Allocator,
+    terminal: Terminal,
+    stream: TerminalStream,
+    closed: bool = false,
+
+    fn init(
+        self: *MirrorSink,
+        alloc: Allocator,
+        io: std.Io,
+        cols: size.CellCountInt,
+        rows: size.CellCountInt,
+    ) !void {
+        self.* = .{
+            .alloc = alloc,
+            .terminal = try .init(io, alloc, .{ .cols = cols, .rows = rows }),
+            .stream = undefined,
+        };
+        self.stream = self.terminal.vtStream();
+    }
+
+    fn deinit(self: *MirrorSink) void {
+        self.stream.deinit();
+        self.terminal.deinit(self.alloc);
+    }
+
+    fn sink(self: *MirrorSink) Sink {
+        return .{ .ctx = self, .vtable = &.{
+            .ops = applyOps,
+            .close = markClosed,
+        } };
+    }
+
+    fn applyOps(ctx: *anyopaque, ops: []const sinkpkg.Op) void {
+        const self: *MirrorSink = @ptrCast(@alignCast(ctx));
+        for (ops) |op| switch (op) {
+            .bytes => |b| self.stream.nextSlice(b),
+            else => sinkpkg.applyOp(
+                self.alloc,
+                &self.terminal,
+                op,
+            ) catch |err| {
+                log.warn("mirror sink failed to apply op: {}", .{err});
+            },
+        };
+    }
+
+    fn markClosed(ctx: *anyopaque) void {
+        const self: *MirrorSink = @ptrCast(@alignCast(ctx));
+        self.closed = true;
+    }
+};
+
+/// Assert that two terminals hold the same visible state.
+fn expectMirrored(expected: *Terminal, actual: *Terminal) !void {
+    try testing.expectEqual(expected.screens.active_key, actual.screens.active_key);
+    try testing.expectEqual(expected.cols, actual.cols);
+    try testing.expectEqual(expected.rows, actual.rows);
+
+    {
+        const want = try expected.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .active = .{} },
+        );
+        defer testing.allocator.free(want);
+        const got = try actual.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .active = .{} },
+        );
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+    {
+        const want = try expected.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .history = .{} },
+        );
+        defer testing.allocator.free(want);
+        const got = try actual.screens.active.dumpStringAlloc(
+            testing.allocator,
+            .{ .history = .{} },
+        );
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    const want_cursor = expected.screens.active.cursor;
+    const got_cursor = actual.screens.active.cursor;
+    try testing.expectEqual(want_cursor.x, got_cursor.x);
+    try testing.expectEqual(want_cursor.y, got_cursor.y);
+    try testing.expectEqual(want_cursor.cursor_style, got_cursor.cursor_style);
+
+    try testing.expectEqual(
+        expected.scrolling_region.top,
+        actual.scrolling_region.top,
+    );
+    try testing.expectEqual(
+        expected.scrolling_region.bottom,
+        actual.scrolling_region.bottom,
+    );
+
+    inline for (.{
+        .cursor_visible,
+        .cursor_blinking,
+        .insert,
+        .wraparound,
+        .keypad_keys,
+        .cursor_keys,
+        .origin,
+        .mouse_event_any,
+        .mouse_event_button,
+        .mouse_event_normal,
+        .mouse_event_x10,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .focus_event,
+        .bracketed_paste,
+    }) |mode| {
+        try testing.expectEqual(
+            expected.modes.get(mode),
+            actual.modes.get(mode),
+        );
+    }
+}
+
 /// Drive a viewer to steady state with a single 83x44 pane (id 0).
 fn testSinglePaneSteps() []const TestStep {
     return &.{
@@ -2662,6 +2744,103 @@ fn testSinglePaneSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
     };
+}
+
+test "attached sink mirrors the pane terminal" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    // Attach once the pane exists but before any capture reply lands,
+    // which is what a caller reacting to the .windows action does.
+    try testViewer(&viewer, testSinglePaneSteps()[0..4]);
+    try viewer.attachPane(0, mirror.sink());
+
+    try testViewer(&viewer, &.{
+        // Primary history, then primary visible, then the alternate pair.
+        .{ .input = .{ .tmux = .{ .block_end = "scrollback line" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "visible line" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // pane_state: cursor at (7,2), origin+insert on, scroll region 1-40.
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\%0;7;2;1;bar;;;0;4294967295;4294967295;1;1;0;0;1;0;0;0;0;0;0;;;1;40;8,16,24
+            ,
+        } } },
+        // Then live output, including a sequence split across two
+        // notifications so the mirror's parser state is exercised too.
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "hello \x1b[3",
+        } } } },
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "1mred",
+        } } } },
+    });
+
+    const pane: *Viewer.Pane = viewer.panes.getEntry(0).?.value_ptr.*;
+    try expectMirrored(&pane.terminal, &mirror.terminal);
+
+    // Sanity: the replay actually did something, so the comparison above
+    // is not just two blank terminals agreeing.
+    const str = try mirror.terminal.screens.active.dumpStringAlloc(
+        testing.allocator,
+        .{ .active = .{} },
+    );
+    defer testing.allocator.free(str);
+    try testing.expect(std.mem.indexOf(u8, str, "hello red") != null);
+}
+
+test "sink is closed when its pane goes away" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    try testing.expect(!mirror.closed);
+
+    // Switching session resets the viewer, which drops every pane.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 2,
+            .name = "other",
+        } } } },
+    });
+
+    try testing.expect(!viewer.panes.contains(0));
+    try testing.expect(mirror.closed);
+}
+
+test "detaching a pane closes its sink" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    viewer.detachPane(0);
+    try testing.expect(mirror.closed);
+
+    // Detach is idempotent and unknown panes are fine.
+    viewer.detachPane(0);
+    viewer.detachPane(1234);
+
+    try testing.expectError(error.UnknownPane, viewer.attachPane(
+        1234,
+        mirror.sink(),
+    ));
 }
 
 test "output escape sequence split across notifications" {
