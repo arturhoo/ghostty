@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
 
 const Terminal = @import("../Terminal.zig");
 const ScreenSet = @import("../ScreenSet.zig");
@@ -72,6 +73,69 @@ pub const Op = union(enum) {
         cols: size.CellCountInt,
         rows: size.CellCountInt,
     },
+
+    /// Copy an op so it can outlive the sink call that delivered it.
+    ///
+    /// A sink that hands ops to another thread has to do this: the
+    /// payloads point into the viewer's notification and arena memory.
+    pub fn clone(self: Op, alloc: Allocator) Allocator.Error!Op {
+        return switch (self) {
+            .bytes => |b| .{ .bytes = try alloc.dupe(u8, b) },
+
+            // The parsed pane state is a flat struct of scalars and
+            // slices, so walk it rather than naming the string fields:
+            // tmux keeps adding columns, and a missed one here is a
+            // dangling pointer rather than a compile error.
+            .pane_state => |data| state: {
+                var copy = data;
+                errdefer freePaneState(alloc, copy, data);
+                inline for (@typeInfo(PaneStateData).@"struct".fields) |f| {
+                    if (comptime f.type == []const u8) {
+                        @field(copy, f.name) = try alloc.dupe(
+                            u8,
+                            @field(data, f.name),
+                        );
+                    }
+                }
+                break :state .{ .pane_state = copy };
+            },
+
+            .switch_screen,
+            .scroll_into_history,
+            .erase_and_home,
+            .resize,
+            => self,
+        };
+    }
+
+    /// Free an op produced by `clone`. Never call this on an op that came
+    /// straight from the viewer; those payloads are not ours.
+    pub fn deinit(self: Op, alloc: Allocator) void {
+        switch (self) {
+            .bytes => |b| alloc.free(b),
+            .pane_state => |data| freePaneState(alloc, data, null),
+            else => {},
+        }
+    }
+
+    /// Free the duped strings of `copy`, skipping any field that is still
+    /// aliasing `original` because `clone` had not reached it yet.
+    fn freePaneState(
+        alloc: Allocator,
+        copy: PaneStateData,
+        original: ?PaneStateData,
+    ) void {
+        inline for (@typeInfo(PaneStateData).@"struct".fields) |f| {
+            if (comptime f.type == []const u8) {
+                const field = @field(copy, f.name);
+                const skip = if (original) |o|
+                    field.ptr == @field(o, f.name).ptr
+                else
+                    false;
+                if (!skip) alloc.free(field);
+            }
+        }
+    }
 };
 
 /// A consumer of a pane's operations.
@@ -261,4 +325,51 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) void {
             .{ data.pane_id, err },
         );
     };
+}
+
+test "cloned ops own their payloads" {
+    const alloc = testing.allocator;
+
+    // Build the payloads in a buffer we scribble over afterwards, so a
+    // clone that aliased its source is caught rather than merely lucky.
+    var scratch: [32]u8 = undefined;
+    @memcpy(scratch[0..5], "hello");
+    @memcpy(scratch[8..13], "block");
+    @memcpy(scratch[16..20], "8,16");
+
+    var data: PaneStateData = std.mem.zeroes(PaneStateData);
+    data.pane_id = 3;
+    data.cursor_shape = scratch[8..13];
+    data.pane_tabs = scratch[16..20];
+
+    const bytes = try (Op{ .bytes = scratch[0..5] }).clone(alloc);
+    defer bytes.deinit(alloc);
+    const state = try (Op{ .pane_state = data }).clone(alloc);
+    defer state.deinit(alloc);
+
+    @memset(&scratch, 'x');
+
+    try testing.expectEqualStrings("hello", bytes.bytes);
+    try testing.expectEqualStrings("block", state.pane_state.cursor_shape);
+    try testing.expectEqualStrings("8,16", state.pane_state.pane_tabs);
+    try testing.expectEqual(3, state.pane_state.pane_id);
+}
+
+test "cloning a payload-free op copies it as-is" {
+    const alloc = testing.allocator;
+    const ops: []const Op = &.{
+        .{ .switch_screen = .alternate },
+        .scroll_into_history,
+        .erase_and_home,
+        .{ .resize = .{ .cols = 80, .rows = 24 } },
+    };
+
+    for (ops) |op| {
+        const copy = try op.clone(alloc);
+        defer copy.deinit(alloc);
+        try testing.expectEqual(
+            std.meta.activeTag(op),
+            std.meta.activeTag(copy),
+        );
+    }
 }
