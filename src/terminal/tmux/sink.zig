@@ -206,11 +206,18 @@ pub fn applyPaneState(t: *Terminal, data: PaneStateData) void {
     t.modes.set(.cursor_keys, data.keypad_cursor_flag);
     t.modes.set(.origin, data.origin_flag);
 
-    // Mouse modes
+    // Mouse tracking modes. tmux names these after its internal
+    // MODE_MOUSE_* flags, which do not line up with the DECSET numbers
+    // by name: MODE_MOUSE_STANDARD is 1000, MODE_MOUSE_BUTTON is 1002,
+    // MODE_MOUSE_ALL is 1003 (tmux input.c).
+    t.modes.set(.mouse_event_normal, data.mouse_standard_flag);
+    t.modes.set(.mouse_event_button, data.mouse_button_flag);
     t.modes.set(.mouse_event_any, data.mouse_all_flag);
-    t.modes.set(.mouse_event_button, data.mouse_any_flag);
-    t.modes.set(.mouse_event_normal, data.mouse_button_flag);
-    t.modes.set(.mouse_event_x10, data.mouse_standard_flag);
+
+    // `mouse_any_flag` is deliberately unused: it is a roll-up of the
+    // three modes above, not a mode of its own. tmux has no DECSET 9
+    // either, so nothing here can set mouse_event_x10.
+
     t.modes.set(.mouse_format_utf8, data.mouse_utf8_flag);
     t.modes.set(.mouse_format_sgr, data.mouse_sgr_flag);
 

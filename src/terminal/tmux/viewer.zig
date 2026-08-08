@@ -2746,6 +2746,36 @@ fn testSinglePaneSteps() []const TestStep {
     };
 }
 
+test "pane state maps tmux mouse flags to the right modes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // tmux reports normal tracking only: mouse_standard_flag is set,
+        // and mouse_any_flag is set because it is a roll-up of the three
+        // tracking modes rather than a mode of its own.
+        //
+        //  ...;mouse_all;mouse_any;mouse_button;mouse_standard;utf8;sgr;...
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;1;0;1;0;0;0;0;0;39;8,16
+            ,
+        } } },
+    });
+
+    const pane: *Viewer.Pane = viewer.panes.getEntry(0).?.value_ptr.*;
+    const t: *Terminal = &pane.terminal;
+
+    // MODE_MOUSE_STANDARD is DECSET 1000, which is mouse_event_normal.
+    try testing.expect(t.modes.get(.mouse_event_normal));
+    try testing.expect(!t.modes.get(.mouse_event_button));
+    try testing.expect(!t.modes.get(.mouse_event_any));
+
+    // tmux has no DECSET 9, so nothing can turn x10 on.
+    try testing.expect(!t.modes.get(.mouse_event_x10));
+}
+
 test "attached sink mirrors the pane terminal" {
     var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
