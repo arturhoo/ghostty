@@ -10,6 +10,7 @@ pub const Viewer = @import("tmux/viewer.zig").Viewer;
 pub const WindowSet = @import("tmux/window_set.zig").WindowSet;
 pub const sink = @import("tmux/sink.zig");
 pub const Router = @import("tmux/router.zig").Router;
+pub const layout_plan = @import("tmux/layout_plan.zig");
 pub const Op = sink.Op;
 pub const Sink = sink.Sink;
 
