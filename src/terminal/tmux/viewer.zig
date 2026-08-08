@@ -1092,17 +1092,40 @@ pub const Viewer = struct {
     /// only mirror what happens from now on; re-capturing for a late
     /// attacher is not implemented yet.
     ///
+    /// The sink's first op is always a `.resize` carrying the pane's
+    /// current size, so a consumer never has to guess the geometry it is
+    /// about to receive content for.
+    ///
+    /// Fails with `PaneMidSequence` if the pane's parser is part way
+    /// through an escape sequence. The sink's parser starts fresh, so it
+    /// would receive the tail without the prefix and print it as text.
+    /// Attaching again once the sequence completes will succeed.
+    ///
     /// An existing sink for the pane is closed and replaced.
     pub fn attachPane(
         self: *Viewer,
         pane_id: usize,
         s: Sink,
-    ) error{UnknownPane}!void {
+    ) error{ UnknownPane, PaneMidSequence }!void {
         const entry = self.panes.getEntry(pane_id) orelse
             return error.UnknownPane;
         const pane: *Pane = entry.value_ptr.*;
+
+        if (!pane.stream.ground()) {
+            log.info(
+                "attach to pane id={} while mid-sequence, refusing",
+                .{pane_id},
+            );
+            return error.PaneMidSequence;
+        }
+
         if (pane.sink) |old| old.close();
         pane.sink = s;
+
+        s.send(&.{.{ .resize = .{
+            .cols = pane.terminal.cols,
+            .rows = pane.terminal.rows,
+        } }});
     }
 
     /// Stop mirroring a pane. Closes the sink. Safe to call for a pane
@@ -1343,6 +1366,19 @@ pub const Viewer = struct {
 
     fn defunct(self: *Viewer) []const Action {
         self.state = .defunct;
+
+        // Nothing will ever be delivered to a pane again, so say so now.
+        // Waiting for the viewer to be torn down would leave anything
+        // mirroring a pane believing it is still live.
+        var it = self.panes.iterator();
+        while (it.next()) |kv| {
+            const pane: *Pane = kv.value_ptr.*;
+            if (pane.sink) |s| {
+                s.close();
+                pane.sink = null;
+            }
+        }
+
         return self.singleAction(.exit);
     }
 };
@@ -2955,6 +2991,76 @@ test "sink is closed when its pane goes away" {
     });
 
     try testing.expect(!viewer.panes.contains(0));
+    try testing.expect(mirror.closed);
+}
+
+test "attach sizes the sink from the pane" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    // Deliberately the wrong size: attaching has to correct it.
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 10, 5);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+
+    try testing.expectEqual(83, mirror.terminal.cols);
+    try testing.expectEqual(44, mirror.terminal.rows);
+}
+
+test "attach is refused while the pane is mid-sequence" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+
+    // Leave the pane's parser part way through an SGR sequence.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "\x1b[3",
+        } } } },
+    });
+    try testing.expectError(
+        error.PaneMidSequence,
+        viewer.attachPane(0, mirror.sink()),
+    );
+
+    // Once the sequence completes, attaching works.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "1m",
+        } } } },
+    });
+    try viewer.attachPane(0, mirror.sink());
+}
+
+test "sinks are closed when the connection ends" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    var mirror: MirrorSink = undefined;
+    try mirror.init(testing.allocator, testing.io, 83, 44);
+    defer mirror.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try viewer.attachPane(0, mirror.sink());
+    try testing.expect(!mirror.closed);
+
+    try testViewer(&viewer, &.{
+        .{
+            .input = .{ .tmux = .exit },
+            .contains_tags = &.{.exit},
+        },
+    });
+
     try testing.expect(mirror.closed);
 }
 
