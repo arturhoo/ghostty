@@ -9,6 +9,7 @@ const CursorStyle = @import("../cursor.zig").Style;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const Terminal = @import("../Terminal.zig");
+const TerminalStream = @import("../stream_terminal.zig").Stream;
 const Layout = @import("layout.zig").Layout;
 const control = @import("control.zig");
 const output = @import("output.zig");
@@ -194,7 +195,7 @@ pub const Viewer = struct {
     action_single: [1]Action,
 
     pub const CommandQueue = CircBuf(Command, undefined);
-    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, Pane);
+    pub const PanesMap = std.AutoArrayHashMapUnmanaged(usize, *Pane);
 
     pub const Action = union(enum) {
         /// Tmux has closed the control mode connection, we should end
@@ -265,11 +266,53 @@ pub const Viewer = struct {
         }
     };
 
+    /// A single tmux pane.
+    ///
+    /// Panes are heap allocated and referenced by pointer from `PanesMap`,
+    /// so that a pane keeps one address for its whole life. That matters
+    /// because `stream` contains pointers back into the pane: the parser's
+    /// handler points at `terminal`, and the OSC parser's capture writer
+    /// points into the parser's own buffer. A pane stored by value in a
+    /// hash map would have all of those silently invalidated the first
+    /// time the map grew or the pane was moved between maps, and a
+    /// half-parsed OSC sequence would then write through a dangling
+    /// pointer.
     pub const Pane = struct {
         terminal: Terminal,
 
-        pub fn deinit(self: *Pane, alloc: Allocator) void {
+        /// The VT parser for this pane.
+        ///
+        /// This is persistent because tmux splits a pane's output across
+        /// `%output` notifications wherever the pty write landed, so an
+        /// escape sequence can straddle two of them. A fresh parser per
+        /// notification loses the prefix and prints the tail as text.
+        stream: TerminalStream,
+
+        pub fn create(
+            io: std.Io,
+            alloc: Allocator,
+            cols: size.CellCountInt,
+            rows: size.CellCountInt,
+        ) !*Pane {
+            const self = try alloc.create(Pane);
+            errdefer alloc.destroy(self);
+
+            self.terminal = try .init(io, alloc, .{
+                .cols = cols,
+                .rows = rows,
+            });
+            errdefer self.terminal.deinit(alloc);
+
+            // Only valid because `self` never moves again.
+            self.stream = self.terminal.vtStream();
+
+            return self;
+        }
+
+        pub fn destroy(self: *Pane, alloc: Allocator) void {
+            self.stream.deinit();
             self.terminal.deinit(alloc);
+            alloc.destroy(self);
         }
     };
 
@@ -311,7 +354,7 @@ pub const Viewer = struct {
         }
         {
             var it = self.panes.iterator();
-            while (it.next()) |kv| kv.value_ptr.deinit(self.alloc);
+            while (it.next()) |kv| kv.value_ptr.*.destroy(self.alloc);
             self.panes.deinit(self.alloc);
         }
         if (self.tmux_version.len > 0) {
@@ -735,7 +778,7 @@ pub const Viewer = struct {
             var panes_it = panes.iterator();
             while (panes_it.next()) |kv| {
                 if (!self.panes.contains(kv.key_ptr.*)) {
-                    kv.value_ptr.deinit(self.alloc);
+                    kv.value_ptr.*.destroy(self.alloc);
                 }
             }
             panes.deinit(self.alloc);
@@ -807,8 +850,7 @@ pub const Viewer = struct {
             for (removed.items) |id| if (self.panes.fetchSwapRemove(
                 id,
             )) |entry_const| {
-                var entry = entry_const;
-                entry.value.deinit(self.alloc);
+                entry_const.value.destroy(self.alloc);
             };
             // We can now deinit self.panes because the existing
             // entries are preserved.
@@ -1027,7 +1069,7 @@ pub const Viewer = struct {
                 log.info("received pane state for untracked pane id={}", .{data.pane_id});
                 continue;
             };
-            const pane: *Pane = entry.value_ptr;
+            const pane: *Pane = entry.value_ptr.*;
             const t: *Terminal = &pane.terminal;
 
             // Determine which screen to use based on alternate_on
@@ -1132,6 +1174,18 @@ pub const Viewer = struct {
                     t.tabstops.set(col_cell);
                 }
             }
+
+            // Everything above addresses screens by key, so the pane is
+            // still on whichever screen the last capture replay left
+            // active: the alternate one, since that is the last capture
+            // we queue. tmux just told us which screen the pane is
+            // really on, so put it back.
+            _ = t.switchScreen(screen_key) catch |err| {
+                log.warn(
+                    "failed to restore active screen pane id={}: {}",
+                    .{ data.pane_id, err },
+                );
+            };
         }
     }
 
@@ -1146,14 +1200,14 @@ pub const Viewer = struct {
             log.info("received pane history for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
         const screen: *Screen = t.screens.active;
 
-        // Get a VT stream from the terminal so we can send data into it.
-        // This will populate the active area too so it won't be exactly
-        // correct but we'll get the active contents soon.
+        // Send the data into the pane's stream. This will populate the
+        // active area too so it won't be exactly correct but we'll get
+        // the active contents soon.
         //
         // The captures ask tmux to escape everything non-printable so that
         // no raw ESC ever reaches the DCS carrying control mode, so the
@@ -1163,9 +1217,7 @@ pub const Viewer = struct {
         // never grows the input, so the reply's own length is enough room.
         const buf = try self.alloc.alloc(u8, content.len);
         defer self.alloc.free(buf);
-        var stream = t.vtStream();
-        defer stream.deinit();
-        stream.nextSlice(control.unescape(buf, content));
+        pane.stream.nextSlice(control.unescape(buf, content));
 
         // Populate the active area to be empty since this is only history.
         // We'll fill it with blanks and move the cursor to the top-left.
@@ -1195,7 +1247,7 @@ pub const Viewer = struct {
             log.info("received pane visible for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
+        const pane: *Pane = entry.value_ptr.*;
         const t: *Terminal = &pane.terminal;
         _ = try t.switchScreen(screen_key);
 
@@ -1206,9 +1258,7 @@ pub const Viewer = struct {
 
         const buf = try self.alloc.alloc(u8, content.len);
         defer self.alloc.free(buf);
-        var stream = t.vtStream();
-        defer stream.deinit();
-        stream.nextSlice(control.unescape(buf, content));
+        pane.stream.nextSlice(control.unescape(buf, content));
     }
 
     fn receivedOutput(
@@ -1220,12 +1270,8 @@ pub const Viewer = struct {
             log.info("received output for untracked pane id={}", .{id});
             return;
         };
-        const pane: *Pane = entry.value_ptr;
-        const t: *Terminal = &pane.terminal;
-
-        var stream = t.vtStream();
-        defer stream.deinit();
-        stream.nextSlice(data);
+        const pane: *Pane = entry.value_ptr.*;
+        pane.stream.nextSlice(data);
     }
 
     /// Convert a tmux layout dimension into a terminal cell count. tmux
@@ -1272,39 +1318,25 @@ pub const Viewer = struct {
                 // If we already have this pane, it is already initialized
                 // so just copy it over. It may have been resized by the
                 // layout change that brought us here, though.
-                if (panes_old.getEntry(id)) |entry| {
-                    // Resize the pane we're copying FROM, not the copy.
-                    // Both structs share the same heap state, so resizing
-                    // the copy would leave the original stale, and the
-                    // original is what our caller's errdefer keeps if a
-                    // later pane in this layout fails to initialize.
-                    //
+                if (panes_old.get(id)) |pane| {
                     // A zero dimension can't be resized to and only shows
                     // up in a malformed layout, so leave the pane alone
                     // rather than failing the whole sync.
                     if (cols > 0 and rows > 0 and
-                        (entry.value_ptr.terminal.cols != cols or
-                            entry.value_ptr.terminal.rows != rows))
+                        (pane.terminal.cols != cols or
+                            pane.terminal.rows != rows))
                     {
-                        try entry.value_ptr.terminal.resize(gpa_alloc, .{
+                        try pane.terminal.resize(gpa_alloc, .{
                             .cols = cols,
                             .rows = rows,
                         });
                     }
 
-                    gop.value_ptr.* = entry.value_ptr.*;
+                    gop.value_ptr.* = pane;
                     break :pane;
                 }
 
-                var t: Terminal = try .init(io, gpa_alloc, .{
-                    .cols = cols,
-                    .rows = rows,
-                });
-                errdefer t.deinit(gpa_alloc);
-
-                gop.value_ptr.* = .{
-                    .terminal = t,
-                };
+                gop.value_ptr.* = try Pane.create(io, gpa_alloc, cols, rows);
             },
         }
     }
@@ -1817,7 +1849,7 @@ test "initial flow" {
             }).check,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -1912,7 +1944,7 @@ test "initial flow" {
             .check = (struct {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
@@ -1975,7 +2007,7 @@ test "capture replay decodes escaped escape sequences" {
             }).check,
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
@@ -1991,7 +2023,7 @@ test "capture replay decodes escaped escape sequences" {
             .input = .{ .tmux = .{ .block_end = "\\033[31mRED" } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     const str = try screen.dumpStringAlloc(
                         testing.allocator,
@@ -2385,7 +2417,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2428,7 +2460,7 @@ test "two pane flow with pane state" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                     const screen: *Screen = pane.terminal.screens.active;
                     {
                         const str = try screen.dumpStringAlloc(
@@ -2466,7 +2498,7 @@ test "two pane flow with pane state" {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     // Pane 0: cursor at (42, 0), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(42, screen.cursor.x);
@@ -2480,7 +2512,7 @@ test "two pane flow with pane state" {
                     }
                     // Pane 4: cursor at (10, 5), cursor visible, wraparound on
                     {
-                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr;
+                        const pane: *Viewer.Pane = v.panes.getEntry(4).?.value_ptr.*;
                         const t: *Terminal = &pane.terminal;
                         const screen: *Screen = t.screens.get(.primary).?;
                         try testing.expectEqual(10, screen.cursor.x);
@@ -2694,6 +2726,100 @@ test "write before startup completes is dropped" {
     });
 }
 
+/// Drive a viewer to steady state with a single 83x44 pane (id 0).
+fn testSinglePaneSteps() []const TestStep {
+    return &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\$0 @0 83 44 b7dd,83x44,0,0,0
+            ,
+        } } },
+        // Four capture-pane replies plus pane_state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    };
+}
+
+test "output escape sequence split across notifications" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // pane_state, alternate_on = 0.
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16
+            ,
+        } } },
+
+        // A single SGR sequence delivered in two pieces, which is what a
+        // pty does whenever a write lands on a buffer boundary. The
+        // parser has to remember it is mid-sequence.
+        .{ .input = .{ .tmux = .{ .output = .{
+            .pane_id = 0,
+            .data = "\x1b[3",
+        } } } },
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "1mX",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+
+                    // With a fresh parser per notification the escape is
+                    // lost and the tail is printed literally as "1mX".
+                    try testing.expectEqualStrings("X", str);
+                }
+            }).check,
+        },
+    });
+}
+
+test "pane state restores the active screen" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // The last capture replayed was the alternate screen, so the
+        // active screen is left on alternate. pane_state says this pane
+        // is not in the alternate screen, so it has to switch back.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\%0;0;0;1;;;;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;;;0;39;8,16
+                ,
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
+                    try testing.expectEqual(
+                        .primary,
+                        pane.terminal.screens.active_key,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
 test "layout dimensions clamp to the cell count limit" {
     const max = std.math.maxInt(size.CellCountInt);
     try testing.expectEqual(80, Viewer.layoutCellCount(80));
@@ -2721,7 +2847,7 @@ test "layout change resizes a surviving pane" {
             } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     try testing.expectEqual(83, pane.terminal.cols);
                     try testing.expectEqual(44, pane.terminal.rows);
                 }
@@ -2743,12 +2869,12 @@ test "layout change resizes a surviving pane" {
             } } },
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
-                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr.*;
                     try testing.expectEqual(83, pane.terminal.cols);
                     try testing.expectEqual(22, pane.terminal.rows);
 
                     // The newly added pane is sized from the layout too.
-                    const added: *Viewer.Pane = v.panes.getEntry(2).?.value_ptr;
+                    const added: *Viewer.Pane = v.panes.getEntry(2).?.value_ptr.*;
                     try testing.expectEqual(83, added.terminal.cols);
                     try testing.expectEqual(21, added.terminal.rows);
                 }
