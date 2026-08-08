@@ -1,0 +1,140 @@
+# Fork-only macOS CI — compiles ghostty's Apple-target code on free
+# GitHub-hosted macOS runners (public repos: free & unlimited minutes).
+#
+# Companion to fork-ci.yml (ubuntu). Same trigger design: lives only on
+# `main`; for stacked PRs based on feature branches, trigger manually:
+#   gh workflow run fork-ci-macos.yml --repo arturhoo/ghostty --ref <branch>
+#
+# Runner choice: `macos-26` (arm64, M-series, 3-4 cores / 7-8 GB RAM).
+# Rationale: HACKING.md requires Xcode 26 + the macOS 26 SDK for main-branch
+# development, and the macos-26 image ships Xcode 26.6 as its DEFAULT —
+# the exact version upstream's test.yml selects (`Xcode_26.6.app`).
+# macos-15 images carry Xcode 16.x, which cannot build main.
+# Free-plan limit: max 5 concurrent macOS jobs, 6h/job cap.
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+name: Fork CI (macOS)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Job 1 — the cheap gate. Type-checks src/apprt/embedded.zig (and all
+  # Apple-target Zig) by building the GhosttyKit xcframework for the
+  # native arch only. `-Dxcframework-target=native` skips the x86_64,
+  # iOS, and iOS-simulator recompiles of the whole core (~4x less work
+  # than the default `universal`). `-Di18n=false` avoids needing msgfmt.
+  ghosttykit:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get required Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      # setup-zig also caches the Zig global cache dir between runs.
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Cache Zig local cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-local-${{ runner.os }}-${{ steps.zig.outputs.version }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-local-${{ runner.os }}-${{ steps.zig.outputs.version }}-
+
+      # Match upstream's pinned Xcode (also the image default, but pin it
+      # so image rotations don't silently change the toolchain). If this
+      # path ever 404s, `ls /Applications | grep Xcode` in a debug run.
+      - name: Xcode Select
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+
+      # Since Xcode 26 the Metal compiler is a separate ~700 MB component
+      # and it is NOT preinstalled on macos-26 images
+      # (actions/runner-images#13014). Ghostty's MetallibStep runs
+      # `xcrun metal` to compile shaders, so this is mandatory.
+      - name: Install Metal Toolchain
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
+      # This is the command that type-checks src/apprt/embedded.zig:
+      # on a Darwin target, app-runtime defaults to `none`, the artifact
+      # is a lib, and src/apprt.zig selects the embedded apprt for libs.
+      - name: Build GhosttyKit (native)
+        run: zig build -Demit-macos-app=false -Dxcframework-target=native -Di18n=false --summary all
+
+  # Job 2 — the full thing: universal GhosttyKit (macOS arm64+x86_64,
+  # iOS, iOS simulator) + the Swift app via xcodebuild. Slower (four
+  # compiles of the Zig core + Swift). Mirrors upstream's build-macos
+  # job minus Nix/Cachix/Namespace. Comment this job out if runtime cost
+  # is annoying, or gate it on workflow_dispatch only.
+  macos-app:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get required Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Cache Zig local cache
+        uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-local-app-${{ runner.os }}-${{ steps.zig.outputs.version }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-local-app-${{ runner.os }}-${{ steps.zig.outputs.version }}-
+
+      - name: Xcode Select
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+
+      - name: Xcode Version
+        run: xcodebuild -version
+
+      - name: Install Metal Toolchain
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
+      # i18n is on by default and GhosttyI18n shells out to msgfmt;
+      # macOS doesn't ship gettext. Usually preinstalled via brew on the
+      # runner image; install defensively.
+      - name: Install gettext (msgfmt)
+        run: which msgfmt || brew install gettext
+
+      # Universal xcframework, resources, i18n — everything the Xcode
+      # project expects on disk (upstream runs exactly this, via nix).
+      - name: Build GhosttyKit (universal)
+        run: zig build -Demit-macos-app=false --summary all
+
+      # Swift app. Upstream runs plain `xcodebuild -target Ghostty`
+      # (ad-hoc signing works on hosted runners). If signing errors
+      # appear, append: CODE_SIGNING_ALLOWED=NO
+      - name: Build Ghostty.app
+        run: |
+          cd macos
+          xcodebuild -target Ghostty
+
+      # Optional: verify the iOS target also compiles (upstream does).
+      # Uncomment if you touch iOS-relevant code.
+      # - name: Build Ghostty iOS
+      #   run: |
+      #     cd macos
+      #     xcodebuild -target Ghostty-iOS "CODE_SIGNING_ALLOWED=NO"

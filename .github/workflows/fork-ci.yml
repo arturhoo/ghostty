@@ -66,3 +66,11 @@ jobs:
 
       - name: zig build test
         run: zig build test -Dapp-runtime=none --summary all
+
+      # `zig build test` does NOT compile the embedded apprt: the test
+      # step builds an exe, and src/apprt.zig only selects `embedded`
+      # for a lib artifact. Building the lib does, so this catches
+      # errors in src/apprt/embedded.zig that the test step cannot see.
+      # It found one the first time it was run.
+      - name: zig build (lib, compiles the embedded apprt)
+        run: zig build -Dapp-runtime=none --summary all
