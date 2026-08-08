@@ -3,6 +3,7 @@ const Self = @This();
 const std = @import("std");
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
+const termio = @import("../../termio.zig");
 const CoreSurface = @import("../../Surface.zig");
 const ApprtApp = @import("App.zig");
 const Application = @import("class/application.zig").Application;
@@ -96,6 +97,12 @@ pub fn setClipboard(
 
 pub fn defaultTermioEnv(self: *Self) !std.process.Environ.Map {
     return try self.surface.defaultTermioEnv();
+}
+
+/// The tmux control mode pane this surface displays, if it was created
+/// for one. The core surface uses the pty-less backend when this is set.
+pub fn tmuxPane(self: *Self) ?termio.Tmux.Pane {
+    return self.surface.tmuxPane();
 }
 
 /// Redraw the inspector for our surface.
