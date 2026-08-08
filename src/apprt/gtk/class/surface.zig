@@ -18,6 +18,7 @@ const internal_os = @import("../../../os/main.zig");
 const renderer = @import("../../../renderer.zig");
 const terminal = @import("../../../terminal/main.zig");
 const termio = @import("../../../termio.zig");
+const TmuxSession = @import("../TmuxSession.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
 const ext = @import("../ext.zig");
@@ -745,6 +746,10 @@ pub const Surface = extern struct {
             pub const none: @This() = .{};
         } = .none,
 
+        /// The tabs and panes this surface has on screen, if it is
+        /// running a tmux control mode client.
+        tmux_session: ?*TmuxSession = null,
+
         pub var offset: c_int = 0;
     };
 
@@ -778,6 +783,33 @@ pub const Surface = extern struct {
     /// The tmux pane this surface displays, if it was created for one.
     pub fn tmuxPane(self: *Self) ?termio.Tmux.Pane {
         return self.private().overrides.tmux;
+    }
+
+    /// Lay out the tmux windows this surface is hosting.
+    ///
+    /// The session is created the first time tmux tells us about any
+    /// windows, and lives until this surface goes away.
+    pub fn tmuxWindows(
+        self: *Self,
+        windows: []const terminal.tmux.WindowSet.Window,
+    ) void {
+        const priv: *Private = self.private();
+        const alloc = Application.default().allocator();
+
+        const session = priv.tmux_session orelse session: {
+            const core_surface = self.core() orelse return;
+            const router = core_surface.tmuxRouter() orelse return;
+            errdefer router.unref();
+
+            const created = TmuxSession.create(alloc, router) catch |err| {
+                log.warn("failed to start tmux session state err={}", .{err});
+                return;
+            };
+            priv.tmux_session = created;
+            break :session created;
+        };
+
+        session.sync(self, windows);
     }
 
     pub fn core(self: *Self) ?*CoreSurface {
@@ -2003,6 +2035,12 @@ pub const Surface = extern struct {
         if (priv.overrides.tmux) |t| {
             t.router.unref();
             priv.overrides.tmux = null;
+        }
+        if (priv.tmux_session) |session| {
+            // Takes the pane tabs with it: without their host there is
+            // nothing feeding them.
+            session.destroy();
+            priv.tmux_session = null;
         }
 
         // Clean up key sequence and key table state

@@ -728,6 +728,7 @@ pub const Application = extern struct {
             .new_split => return Action.newSplit(target, value),
 
             .new_tab => return Action.newTab(target),
+            .tmux_windows => return Action.tmuxWindows(target, value),
 
             .new_window => try Action.newWindow(
                 self,
@@ -806,7 +807,6 @@ pub const Application = extern struct {
             .check_for_updates,
             .undo,
             .redo,
-            .tmux_windows,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -2476,6 +2476,26 @@ const Action = struct {
                     "&s",
                     @tagName(direction).ptr,
                 ) != 0;
+            },
+        }
+    }
+
+    /// The tmux window layout changed on a surface hosting a control
+    /// mode session. The payload is only ours for the duration of this
+    /// call, so everything we keep is built here.
+    pub fn tmuxWindows(
+        target: apprt.Target,
+        value: apprt.action.TmuxWindows,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("tmux windows to app is unexpected", .{});
+                return false;
+            },
+
+            .surface => |core| {
+                core.rt_surface.surface.tmuxWindows(value.windows);
+                return true;
             },
         }
     }
