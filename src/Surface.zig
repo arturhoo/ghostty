@@ -1089,13 +1089,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .tmux_windows => |set| tmux: {
             if (comptime !terminal.options.tmux_control_mode) break :tmux;
+
+            // The action payload is only valid for the duration of the
+            // call, which is why we can hand out the snapshot's memory
+            // directly and free it as soon as we return.
             defer set.destroy();
 
-            // TODO: hand this to the apprt so the GUI can build windows
-            // and panes out of it.
-            log.info(
-                "tmux windows changed count={}",
-                .{set.windows.len},
+            _ = try self.rt_app.performAction(
+                .{ .surface = self },
+                .tmux_windows,
+                .{ .windows = set.windows },
             );
         },
 

@@ -888,6 +888,46 @@ typedef struct {
   uint64_t len;
 } ghostty_action_scrollbar_s;
 
+// terminal.tmux.WindowSet.Node.Kind
+typedef enum {
+  GHOSTTY_TMUX_NODE_PANE,
+  GHOSTTY_TMUX_NODE_HORIZONTAL,
+  GHOSTTY_TMUX_NODE_VERTICAL,
+} ghostty_tmux_node_kind_e;
+
+// terminal.tmux.WindowSet.Node
+//
+// A node in a window's flattened layout tree. `pane_id` is meaningful only
+// when kind is PANE; `children_start` and `children_end` are meaningful only
+// for a split, and are a half-open range into the owning window's nodes.
+typedef struct {
+  size_t x;
+  size_t y;
+  size_t width;
+  size_t height;
+  ghostty_tmux_node_kind_e kind;
+  size_t pane_id;
+  size_t children_start;
+  size_t children_end;
+} ghostty_tmux_node_s;
+
+// terminal.tmux.WindowSet.Window
+//
+// Node index 0 is the root of the layout tree. `nodes` is never empty.
+typedef struct {
+  size_t id;
+  size_t width;
+  size_t height;
+  const ghostty_tmux_node_s* nodes;
+  size_t nodes_len;
+} ghostty_tmux_window_s;
+
+// apprt.action.TmuxWindows.C
+typedef struct {
+  const ghostty_tmux_window_s* windows;
+  size_t len;
+} ghostty_action_tmux_windows_s;
+
 // apprt.Action.Key
 typedef enum {
   GHOSTTY_ACTION_QUIT,
@@ -958,6 +998,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_MOVE_TAB_TO_NEW_WINDOW,
+  GHOSTTY_ACTION_TMUX_WINDOWS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1000,6 +1041,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_tmux_windows_s tmux_windows;
 } ghostty_action_u;
 
 typedef struct {
