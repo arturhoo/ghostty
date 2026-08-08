@@ -1087,6 +1087,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .close => self.close(),
 
+        .tmux_windows => |set| tmux: {
+            if (comptime !terminal.options.tmux_control_mode) break :tmux;
+            defer set.destroy();
+
+            // TODO: hand this to the apprt so the GUI can build windows
+            // and panes out of it.
+            log.info(
+                "tmux windows changed count={}",
+                .{set.windows.len},
+            );
+        },
+
         .child_exited => |v| self.childExited(v),
 
         .desktop_notification => |notification| {

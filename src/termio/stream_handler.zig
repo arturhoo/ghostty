@@ -448,8 +448,25 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| windows: {
+                            // The action's memory belongs to the viewer's
+                            // arena and dies on the next call to next, so
+                            // the surface gets a snapshot that owns itself.
+                            // It has to be fully built before we push it:
+                            // surfaceMessageWriter can drop the renderer
+                            // lock while it waits on a full mailbox.
+                            const set = terminal.tmux.WindowSet.create(
+                                self.alloc,
+                                windows,
+                            ) catch |err| {
+                                log.warn(
+                                    "failed to snapshot tmux windows: {}",
+                                    .{err},
+                                );
+                                break :windows;
+                            };
+
+                            self.surfaceMessageWriter(.{ .tmux_windows = set });
                         },
                     }
                 }
