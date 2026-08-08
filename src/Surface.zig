@@ -960,6 +960,11 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
+            // Closing a tmux pane kills the pane, which is the same
+            // thing closing a local terminal does to its process. There
+            // is no prompt state of ours to inspect either.
+            if (self.io.backend == .tmux) break :true false;
+
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             break :true !self.io.terminal.cursorIsAtPrompt();
@@ -1348,6 +1353,10 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+
+        // A tmux pane has no local process, so nothing can exit
+        // abnormally; the pane going away arrives as a normal exit.
+        .tmux => unreachable,
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 

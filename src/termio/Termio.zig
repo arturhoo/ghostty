@@ -316,6 +316,80 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     };
 }
 
+/// How the tmux router hands this pane its operations.
+pub fn tmuxEndpoint(self: *Termio) terminalpkg.tmux.Router.Endpoint {
+    return .{ .ctx = self, .vtable = &tmux_endpoint_vtable };
+}
+
+const tmux_endpoint_vtable: terminalpkg.tmux.Router.Endpoint.VTable = .{
+    .ops = tmuxEndpointOps,
+    .close = tmuxEndpointClose,
+};
+
+fn tmuxEndpointOps(ctx: *anyopaque, ops: []const terminalpkg.tmux.Op) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.applyTmuxOps(ops);
+}
+
+fn tmuxEndpointClose(ctx: *anyopaque) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+
+    // Present the pane the way a terminal whose process ended is
+    // presented, which gets us the existing overlay and close behavior
+    // for free. The runtime is deliberately large so this does not look
+    // like a process that died immediately, which is treated as a crash.
+    _ = self.surface_mailbox.push(.{
+        .child_exited = .{
+            .exit_code = 0,
+            .runtime_ms = std.math.maxInt(u64),
+        },
+    }, .{ .forever = {} });
+}
+
+/// Apply tmux pane operations to this pane's terminal.
+///
+/// Called from the router's flush with no other renderer mutex held, so
+/// taking ours here cannot close a cycle.
+///
+/// tmux owns this grid: a `.resize` op is the only thing that resizes it.
+pub fn applyTmuxOps(self: *Termio, ops: []const terminalpkg.tmux.Op) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        for (ops) |op| switch (op) {
+            // Through the full pipeline, so parser state persists across
+            // ops and anything the stream wants to reply to still works.
+            .bytes => |b| self.processOutputLocked(b),
+
+            .resize => |v| self.terminal.resize(self.alloc, .{
+                .cols = v.cols,
+                .rows = v.rows,
+                .cell_size_px = .{
+                    .width = self.size.cell.width,
+                    .height = self.size.cell.height,
+                },
+            }) catch |err| log.warn(
+                "tmux pane resize failed err={}",
+                .{err},
+            ),
+
+            else => terminalpkg.tmux.sink.applyOp(
+                self.alloc,
+                &self.terminal,
+                op,
+            ) catch |err| log.warn(
+                "tmux op failed op={s} err={}",
+                .{ @tagName(op), err },
+            ),
+        };
+    }
+
+    // Ops other than bytes schedule no render of their own, so one
+    // wakeup covers the batch.
+    self.terminal_stream.handler.queueRender() catch unreachable;
+}
+
 /// How the tmux router asks us to talk to the tmux server.
 ///
 /// Every one of these runs on a pane's thread with no lock held, so they
@@ -559,8 +633,22 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
-    // Update the size of our pty.
+    // Update the size of our pty. For a tmux pane this asks tmux to
+    // resize the pane rather than resizing anything itself.
     try self.backend.resize(grid_size, size.terminal());
+
+    // tmux owns a pane's grid. Resizing it here would fight the layout
+    // tmux sends back, so we stop at telling the renderer about the new
+    // widget size and wait for tmux to answer with a resize op.
+    if (self.backend == .tmux) {
+        _ = self.renderer_mailbox.push(
+            global.io(),
+            .{ .resize = size },
+            .{ .forever = {} },
+        );
+        self.renderer_wakeup.notify() catch {};
+        return;
+    }
 
     // Enter the critical area that we want to keep small
     {
