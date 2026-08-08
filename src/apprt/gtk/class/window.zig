@@ -394,6 +394,19 @@ pub const Window = extern struct {
         _ = self.newTabPage(parent_, .tab, .none);
     }
 
+    /// Create a new tab and return it, so the caller can replace its
+    /// contents.
+    ///
+    /// A new tab always comes with one surface in it. A caller that is
+    /// going to install its own tree must do so before returning to the
+    /// main loop: the tree rebuild is deferred to an idle callback, so a
+    /// replacement made in the same turn means the default surface is
+    /// never realized and never starts a process.
+    pub fn newTabForTree(self: *Self, parent_: ?*CoreSurface) *Tab {
+        const page = self.newTabPage(parent_, .tab, .none);
+        return gobject.ext.cast(Tab, page.getChild()).?;
+    }
+
     pub fn newTabForWindow(
         self: *Self,
         parent_: ?*CoreSurface,
