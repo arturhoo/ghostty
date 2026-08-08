@@ -624,8 +624,18 @@ pub fn init(
         .config_conditional_state = app.config_conditional_state,
     };
 
+    // If the app runtime created this surface to display a tmux control
+    // mode pane, it uses the pty-less backend and none of the subprocess
+    // setup below applies.
+    const tmux_pane: ?termio.Tmux.Pane = tmux_pane: {
+        if (comptime !@hasDecl(@TypeOf(rt_surface.*), "tmuxPane")) {
+            break :tmux_pane null;
+        }
+        break :tmux_pane rt_surface.tmuxPane();
+    };
+
     // The command we're going to execute
-    const command: ?configpkg.Command = command: {
+    const command: ?configpkg.Command = if (tmux_pane != null) null else command: {
         if (app.first) {
             if (config.@"initial-command") |command| {
                 break :command command;
@@ -637,7 +647,25 @@ pub fn init(
     // Start our IO implementation
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
-    {
+    if (tmux_pane) |pane| {
+        var io_tmux = termio.Tmux.init(pane);
+        errdefer io_tmux.deinit();
+
+        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+        errdefer io_mailbox.deinit(alloc);
+
+        try termio.Termio.init(&self.io, alloc, .{
+            .size = size,
+            .full_config = config,
+            .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .backend = .{ .tmux = io_tmux },
+            .mailbox = io_mailbox,
+            .renderer_state = &self.renderer_state,
+            .renderer_wakeup = render_thread.wakeup,
+            .renderer_mailbox = render_thread.mailbox,
+            .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+        });
+    } else {
         var env = rt_surface.defaultTermioEnv() catch |err| env: {
             // If an error occurs, we don't want to block surface startup.
             log.warn("error getting env map for surface err={}", .{err});
