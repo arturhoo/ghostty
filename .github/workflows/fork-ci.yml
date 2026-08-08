@@ -1,0 +1,71 @@
+# Fork-only CI.
+#
+# Upstream's test.yml is unusable here: nearly every job runs on
+# `namespace-profile-ghostty-*` (Namespace.so custom runners that only exist
+# in the ghostty-org org), so on this fork those jobs queue forever. Upstream
+# workflows are disabled via repo settings on this fork; this workflow is the
+# replacement, running on free GitHub-hosted `ubuntu-latest` runners.
+#
+# Trigger design (see comment below on `pull_request`) means this fires
+# automatically for:
+#   - pushes to this fork's `main`
+#   - PRs whose base branch is `main` (e.g. the first PR in a stack)
+# For stacked PRs whose base is another feature branch (not `main`), GitHub
+# can only run workflows that are reachable from the base or head ref of the
+# PR. Since this file intentionally does NOT exist on feature branches (they
+# must stay upstream-mergeable), such PRs get no automatic run. Trigger one
+# manually with:
+#   gh workflow run fork-ci.yml --repo arturhoo/ghostty --ref <feature-branch>
+# which runs this workflow definition (from main) against that branch's code.
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+name: Fork CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get required Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # Mirrors the apt package set from src/build/docker/debian/Dockerfile
+      # (see also Dockerfile.toolchain used to validate this workflow
+      # locally). libonig-dev matters: the build fails without it.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq -y --no-install-recommends install \
+            blueprint-compiler \
+            build-essential \
+            libbz2-dev \
+            libonig-dev \
+            libxml2-utils \
+            pandoc \
+            libadwaita-1-dev \
+            libgtk-4-dev \
+            libgtk4-layer-shell-dev
+
+      - name: zig fmt
+        run: zig fmt --check .
+
+      - name: zig build test
+        run: zig build test -Dapp-runtime=none --summary all
