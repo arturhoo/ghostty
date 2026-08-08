@@ -176,6 +176,13 @@ pub const Viewer = struct {
     /// versions as necessary.
     tmux_version: []const u8,
 
+    /// The last client size we reported to tmux, so we don't re-send an
+    /// unchanged one. See `nextClientSize`.
+    last_client_size: ?struct {
+        cols: usize,
+        rows: usize,
+    } = null,
+
     /// The list of commands we've sent that we want to send and wait
     /// for a response for. We only send one command at a time just
     /// to avoid any possible confusion around ordering.
@@ -250,9 +257,37 @@ pub const Viewer = struct {
         /// caller into the bytes a normal pty would receive.
         write: Write,
 
+        /// Ask tmux to resize a pane, because whatever is displaying it
+        /// changed size.
+        resize: Resize,
+
+        /// Tell tmux how big our control mode client is. tmux sizes the
+        /// session to its smallest attached client, so without this a
+        /// second attached client can pin our panes small.
+        client_size: ClientSize,
+
+        /// Ask tmux to kill a pane, because the thing displaying it was
+        /// closed.
+        kill_pane: KillPane,
+
         pub const Write = struct {
             pane_id: usize,
             data: []const u8,
+        };
+
+        pub const Resize = struct {
+            pane_id: usize,
+            cols: usize,
+            rows: usize,
+        };
+
+        pub const ClientSize = struct {
+            cols: usize,
+            rows: usize,
+        };
+
+        pub const KillPane = struct {
+            pane_id: usize,
         };
     };
 
@@ -293,6 +328,13 @@ pub const Viewer = struct {
         /// Where this pane's operations are mirrored, if anything has
         /// attached. See `attachPane`.
         sink: ?Sink = null,
+
+        /// The last size we asked tmux to make this pane. See
+        /// `nextResize` for why this is the request and not the result.
+        last_resize_request: ?struct {
+            cols: usize,
+            rows: usize,
+        } = null,
 
         pub fn create(
             io: std.Io,
@@ -382,7 +424,120 @@ pub const Viewer = struct {
         return switch (input) {
             .tmux => self.nextTmux(input.tmux),
             .write => self.nextWrite(input.write),
+            .resize => self.nextResize(input.resize),
+            .client_size => self.nextClientSize(input.client_size),
+            .kill_pane => self.nextKillPane(input.kill_pane),
         };
+    }
+
+    /// Ask tmux to resize a pane.
+    ///
+    /// Deduplicated against the last size we asked for, not against the
+    /// pane's current size: tmux clamps a resize to what the layout allows,
+    /// so comparing against the result would make us re-send the same
+    /// request forever.
+    fn nextResize(self: *Viewer, r: Input.Resize) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (r.cols == 0 or r.rows == 0) return &.{};
+
+        const pane: *Pane = (self.panes.getEntry(r.pane_id) orelse {
+            log.info("resize of unknown pane id={}, dropping", .{r.pane_id});
+            return &.{};
+        }).value_ptr.*;
+
+        if (pane.last_resize_request) |last| {
+            if (last.cols == r.cols and last.rows == r.rows) return &.{};
+        }
+        pane.last_resize_request = .{ .cols = r.cols, .rows = r.rows };
+
+        return self.queueUserCommand("resize-pane -t %{d} -x {d} -y {d}\n", .{
+            r.pane_id,
+            r.cols,
+            r.rows,
+        }) catch {
+            log.warn("failed to queue resize for pane id={}", .{r.pane_id});
+            return &.{};
+        };
+    }
+
+    /// Tell tmux the size of our control mode client.
+    fn nextClientSize(self: *Viewer, c: Input.ClientSize) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (c.cols == 0 or c.rows == 0) return &.{};
+
+        if (self.last_client_size) |last| {
+            if (last.cols == c.cols and last.rows == c.rows) return &.{};
+        }
+        self.last_client_size = .{ .cols = c.cols, .rows = c.rows };
+
+        return self.queueUserCommand("refresh-client -C {d}x{d}\n", .{
+            c.cols,
+            c.rows,
+        }) catch {
+            log.warn("failed to queue client size", .{});
+            return &.{};
+        };
+    }
+
+    /// Ask tmux to kill a pane.
+    fn nextKillPane(self: *Viewer, k: Input.KillPane) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        if (!self.panes.contains(k.pane_id)) {
+            log.info("kill of unknown pane id={}, dropping", .{k.pane_id});
+            return &.{};
+        }
+
+        return self.queueUserCommand("kill-pane -t %{d}\n", .{
+            k.pane_id,
+        }) catch {
+            log.warn("failed to queue kill for pane id={}", .{k.pane_id});
+            return &.{};
+        };
+    }
+
+    /// Queue a command for tmux, returning the action that sends it if
+    /// nothing else is already in flight.
+    ///
+    /// Everything the caller can ask tmux to do goes through here, so we
+    /// never have more than one command outstanding; tmux answers each
+    /// with a `%begin`/`%end` block that `receivedCommandOutput` discards.
+    fn queueUserCommand(
+        self: *Viewer,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) Allocator.Error![]const Action {
+        assert(self.state == .command_queue);
+
+        // Clear our prior arena so it is ready to be used for any
+        // actions immediately.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        _ = arena.reset(.free_all);
+
+        const command: Command = command: {
+            var builder: std.Io.Writer.Allocating = .init(self.alloc);
+            errdefer builder.deinit();
+            builder.writer.print(fmt, args) catch return error.OutOfMemory;
+            break :command .{ .user = try builder.toOwnedSlice() };
+        };
+        errdefer command.deinit(self.alloc);
+
+        // If a command is already in flight then ours is sent later, when
+        // that one completes (see the tail of `nextCommand`).
+        const was_empty = self.command_queue.empty();
+        const action: ?Action = if (was_empty) action: {
+            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+            command.formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            break :action .{ .command = builder.writer.buffered() };
+        } else null;
+
+        // Must be the last fallible operation: past this point the queue
+        // owns `command` and our errdefer would double free it.
+        try self.queueCommands(&.{command});
+
+        return if (action) |a| self.singleAction(a) else &.{};
     }
 
     /// Send bytes to a pane as tmux `send-keys`.
@@ -429,48 +584,20 @@ pub const Viewer = struct {
         self: *Viewer,
         w: Input.Write,
     ) Allocator.Error![]const Action {
-        assert(self.state == .command_queue);
-
-        // Clear our prior arena so it is ready to be used for any
-        // actions immediately.
-        var arena = self.action_arena.promote(self.alloc);
-        defer self.action_arena = arena.state;
-        _ = arena.reset(.free_all);
-
         // `send-keys -H` takes each key as a hexadecimal number, so we can
         // pass arbitrary encoded input through byte-for-byte without tmux
         // attempting to interpret any of it as a key name.
-        const command: Command = command: {
-            var builder: std.Io.Writer.Allocating = .init(self.alloc);
-            errdefer builder.deinit();
-            builder.writer.print(
-                "send-keys -H -t %{d}",
-                .{w.pane_id},
-            ) catch return error.OutOfMemory;
-            for (w.data) |byte| builder.writer.print(
-                " {x:0>2}",
-                .{byte},
-            ) catch return error.OutOfMemory;
-            builder.writer.writeByte('\n') catch return error.OutOfMemory;
-            break :command .{ .user = try builder.toOwnedSlice() };
-        };
-        errdefer command.deinit(self.alloc);
+        var hex: std.Io.Writer.Allocating = .init(self.alloc);
+        defer hex.deinit();
+        for (w.data) |byte| hex.writer.print(
+            " {x:0>2}",
+            .{byte},
+        ) catch return error.OutOfMemory;
 
-        // If a command is already in flight then ours is sent later, when
-        // that one completes (see the tail of `nextCommand`).
-        const was_empty = self.command_queue.empty();
-        const action: ?Action = if (was_empty) action: {
-            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-            command.formatCommand(&builder.writer) catch
-                return error.OutOfMemory;
-            break :action .{ .command = builder.writer.buffered() };
-        } else null;
-
-        // Must be the last fallible operation: past this point the queue
-        // owns `command` and our errdefer would double free it.
-        try self.queueCommands(&.{command});
-
-        return if (action) |a| self.singleAction(a) else &.{};
+        return self.queueUserCommand("send-keys -H -t %{d}{s}\n", .{
+            w.pane_id,
+            hex.writer.buffered(),
+        });
     }
 
     fn nextTmux(
@@ -2908,6 +3035,131 @@ test "sink is closed when its pane goes away" {
 
     try testing.expect(!viewer.panes.contains(0));
     try testing.expect(mirror.closed);
+}
+
+test "resize asks tmux to resize the pane" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the command queue is empty and
+        // our command is sent immediately rather than queued behind it.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .contains_command = "resize-pane -t %0 -x 100 -y 30\n",
+        },
+        // Drain the resize reply, so the queue is empty again and a
+        // command that is not deduplicated would be sent immediately.
+        // Without that, "no action" would prove nothing.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // The same size again is not worth a round trip.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // A different size is.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 90, .rows = 30 } },
+            .contains_command = "resize-pane -t %0 -x 90 -y 30\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Unknown panes and degenerate sizes are dropped.
+        .{
+            .input = .{ .resize = .{ .pane_id = 9, .cols = 10, .rows = 10 } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 0, .rows = 10 } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "client size is reported to tmux once" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the command queue is empty and
+        // our command is sent immediately rather than queued behind it.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .client_size = .{ .cols = 120, .rows = 40 } },
+            .contains_command = "refresh-client -C 120x40\n",
+        },
+        // Drain the reply so the queue is empty: otherwise "no action"
+        // would just mean "queued behind something".
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .client_size = .{ .cols = 120, .rows = 40 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
+
+test "kill pane asks tmux to kill it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the command queue is empty and
+        // our command is sent immediately rather than queued behind it.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .kill_pane = .{ .pane_id = 0 } },
+            .contains_command = "kill-pane -t %0\n",
+        },
+        .{
+            .input = .{ .kill_pane = .{ .pane_id = 9 } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                }
+            }).check,
+        },
+    });
+}
+
+test "new inputs are dropped before startup completes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 1, .rows = 1 } } },
+        .{ .input = .{ .client_size = .{ .cols = 1, .rows = 1 } } },
+        .{
+            .input = .{ .kill_pane = .{ .pane_id = 0 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
 }
 
 test "attach sizes the sink from the pane" {
