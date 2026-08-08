@@ -2089,6 +2089,22 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
     });
 }
 
+/// The tmux op router, if this surface is hosting a control mode session.
+///
+/// The caller gets its own reference and must `unref` it. This is how the
+/// app runtime reaches the router without it having to travel through an
+/// action payload and the C ABI.
+pub fn tmuxRouter(self: *Surface) ?*terminal.tmux.Router {
+    if (comptime !terminal.options.tmux_control_mode) return null;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const router = self.io.terminal_stream.handler.tmux_router orelse
+        return null;
+    return router.ref();
+}
+
 /// Returns the pwd of the terminal, if any. This is always copied because
 /// the pwd can change at any point from termio. If we are calling from the IO
 /// thread you should just check the terminal directly.
