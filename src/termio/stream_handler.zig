@@ -68,6 +68,11 @@ pub const StreamHandler = struct {
     /// The tmux control mode viewer state.
     tmux_viewer: if (tmux_enabled) ?*terminal.tmux.Viewer else void = if (tmux_enabled) null else {},
 
+    /// Carries pane operations from the viewer out to whatever is
+    /// displaying each pane. Present only while this surface is hosting a
+    /// control mode session. This is an owned reference.
+    tmux_router: if (tmux_enabled) ?*terminal.tmux.Router else void = if (tmux_enabled) null else {},
+
     /// This is set to true when a message was written to the termio
     /// mailbox. This can be used by callers to determine if they need
     /// to wake up the termio thread.
