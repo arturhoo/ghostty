@@ -1228,10 +1228,21 @@ pub const Viewer = struct {
         stream.nextSlice(data);
     }
 
+    /// Convert a tmux layout dimension into a terminal cell count. tmux
+    /// gives us a usize but our terminals are limited to CellCountInt, so
+    /// clamp instead of failing: a layout this large is nonsense, and it
+    /// isn't worth tearing down the session over.
+    fn layoutCellCount(v: usize) size.CellCountInt {
+        return std.math.cast(size.CellCountInt, v) orelse max: {
+            log.warn("layout dimension too large, clamping value={}", .{v});
+            break :max std.math.maxInt(size.CellCountInt);
+        };
+    }
+
     fn initLayout(
         io: std.Io,
         gpa_alloc: Allocator,
-        panes_old: *const PanesMap,
+        panes_old: *PanesMap,
         panes_new: *PanesMap,
         layout: Layout,
     ) !void {
@@ -1255,19 +1266,39 @@ pub const Viewer = struct {
                 if (gop.found_existing) break :pane;
                 errdefer _ = panes_new.swapRemove(gop.key_ptr.*);
 
+                const cols = layoutCellCount(layout.width);
+                const rows = layoutCellCount(layout.height);
+
                 // If we already have this pane, it is already initialized
-                // so just copy it over.
+                // so just copy it over. It may have been resized by the
+                // layout change that brought us here, though.
                 if (panes_old.getEntry(id)) |entry| {
+                    // Resize the pane we're copying FROM, not the copy.
+                    // Both structs share the same heap state, so resizing
+                    // the copy would leave the original stale, and the
+                    // original is what our caller's errdefer keeps if a
+                    // later pane in this layout fails to initialize.
+                    //
+                    // A zero dimension can't be resized to and only shows
+                    // up in a malformed layout, so leave the pane alone
+                    // rather than failing the whole sync.
+                    if (cols > 0 and rows > 0 and
+                        (entry.value_ptr.terminal.cols != cols or
+                            entry.value_ptr.terminal.rows != rows))
+                    {
+                        try entry.value_ptr.terminal.resize(gpa_alloc, .{
+                            .cols = cols,
+                            .rows = rows,
+                        });
+                    }
+
                     gop.value_ptr.* = entry.value_ptr.*;
                     break :pane;
                 }
 
-                // TODO: We need to gracefully handle overflow of our
-                // max cols/width here. In practice we shouldn't hit this
-                // so we cast but its not safe.
                 var t: Terminal = try .init(io, gpa_alloc, .{
-                    .cols = @intCast(layout.width),
-                    .rows = @intCast(layout.height),
+                    .cols = cols,
+                    .rows = rows,
                 });
                 errdefer t.deinit(gpa_alloc);
 
@@ -2657,6 +2688,69 @@ test "write before startup completes is dropped" {
                 fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
                     try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
+
+test "layout dimensions clamp to the cell count limit" {
+    const max = std.math.maxInt(size.CellCountInt);
+    try testing.expectEqual(80, Viewer.layoutCellCount(80));
+    try testing.expectEqual(max, Viewer.layoutCellCount(max));
+    try testing.expectEqual(max, Viewer.layoutCellCount(@as(usize, max) + 1));
+}
+
+test "layout change resizes a surviving pane" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        // One pane filling the window.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    try testing.expectEqual(83, pane.terminal.cols);
+                    try testing.expectEqual(44, pane.terminal.rows);
+                }
+            }).check,
+        },
+        // Drain the capture-pane commands plus pane_state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Split the window. Pane 0 survives but is now only 22 rows tall.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .visible_layout = "e07b,83x44,0,0[83x22,0,0,0,83x21,0,23,2]",
+                .raw_flags = "*",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    try testing.expectEqual(83, pane.terminal.cols);
+                    try testing.expectEqual(22, pane.terminal.rows);
+
+                    // The newly added pane is sized from the layout too.
+                    const added: *Viewer.Pane = v.panes.getEntry(2).?.value_ptr;
+                    try testing.expectEqual(83, added.terminal.cols);
+                    try testing.expectEqual(21, added.terminal.rows);
                 }
             }).check,
         },
