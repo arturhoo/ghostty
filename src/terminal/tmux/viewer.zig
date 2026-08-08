@@ -242,6 +242,15 @@ pub const Viewer = struct {
     pub const Input = union(enum) {
         /// Data from tmux was received that needs to be processed.
         tmux: control.Notification,
+
+        /// Data to write to a pane, e.g. keyboard input encoded by the
+        /// caller into the bytes a normal pty would receive.
+        write: Write,
+
+        pub const Write = struct {
+            pane_id: usize,
+            data: []const u8,
+        };
     };
 
     pub const Window = struct {
@@ -321,7 +330,96 @@ pub const Viewer = struct {
         // state to gracefully handle it.
         return switch (input) {
             .tmux => self.nextTmux(input.tmux),
+            .write => self.nextWrite(input.write),
         };
+    }
+
+    /// Send bytes to a pane as tmux `send-keys`.
+    ///
+    /// This goes through the command queue like any other command so that
+    /// we never have more than one command in flight; tmux replies to it
+    /// with a `%begin`/`%end` block that `receivedCommandOutput` discards.
+    fn nextWrite(
+        self: *Viewer,
+        w: Input.Write,
+    ) []const Action {
+        // We can only send input once we've reached steady state. Before
+        // that we're still replaying startup commands and don't know the
+        // pane set.
+        if (self.state != .command_queue) {
+            log.info(
+                "write to pane id={} while not ready, dropping",
+                .{w.pane_id},
+            );
+            return &.{};
+        }
+
+        // Drop writes to panes we don't know about rather than letting
+        // tmux error on an unknown target.
+        if (!self.panes.contains(w.pane_id)) {
+            log.info("write to unknown pane id={}, dropping", .{w.pane_id});
+            return &.{};
+        }
+
+        // Nothing to send. Avoid a `send-keys` with no keys, which tmux
+        // would interpret as "send the key this command is bound to".
+        if (w.data.len == 0) return &.{};
+
+        return self.queueWrite(w) catch {
+            log.warn(
+                "failed to queue write for pane id={}, dropping",
+                .{w.pane_id},
+            );
+            return &.{};
+        };
+    }
+
+    fn queueWrite(
+        self: *Viewer,
+        w: Input.Write,
+    ) Allocator.Error![]const Action {
+        assert(self.state == .command_queue);
+
+        // Clear our prior arena so it is ready to be used for any
+        // actions immediately.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        _ = arena.reset(.free_all);
+
+        // `send-keys -H` takes each key as a hexadecimal number, so we can
+        // pass arbitrary encoded input through byte-for-byte without tmux
+        // attempting to interpret any of it as a key name.
+        const command: Command = command: {
+            var builder: std.Io.Writer.Allocating = .init(self.alloc);
+            errdefer builder.deinit();
+            builder.writer.print(
+                "send-keys -H -t %{d}",
+                .{w.pane_id},
+            ) catch return error.OutOfMemory;
+            for (w.data) |byte| builder.writer.print(
+                " {x:0>2}",
+                .{byte},
+            ) catch return error.OutOfMemory;
+            builder.writer.writeByte('\n') catch return error.OutOfMemory;
+            break :command .{ .user = try builder.toOwnedSlice() };
+        };
+        errdefer command.deinit(self.alloc);
+
+        // If a command is already in flight then ours is sent later, when
+        // that one completes (see the tail of `nextCommand`).
+        const was_empty = self.command_queue.empty();
+        const action: ?Action = if (was_empty) action: {
+            var builder: std.Io.Writer.Allocating = .init(arena.allocator());
+            command.formatCommand(&builder.writer) catch
+                return error.OutOfMemory;
+            break :action .{ .command = builder.writer.buffered() };
+        } else null;
+
+        // Must be the last fallible operation: past this point the queue
+        // owns `command` and our errdefer would double free it.
+        try self.queueCommands(&.{command});
+
+        return if (action) |a| self.singleAction(a) else &.{};
     }
 
     fn nextTmux(
@@ -2285,6 +2383,198 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .exit },
             .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "write sends keys to the target pane" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // One window with a single pane, id 0.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // Drain the capture-pane commands so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // With the queue empty, a write is sent immediately as a hex-encoded
+        // send-keys. "hi" is 0x68 0x69.
+        .{
+            .input = .{ .write = .{ .pane_id = 0, .data = "hi" } },
+            .check_command = (struct {
+                fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    try testing.expectEqualStrings(
+                        "send-keys -H -t %0 68 69\n",
+                        command,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
+test "write waits for the in-flight command" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // One window with a single pane, id 0. This leaves the pane setup
+        // commands queued with the first already in flight.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // A write now must not jump the queue: we only ever have one
+        // command in flight, so it produces no action yet and is appended
+        // behind the five pending pane setup commands.
+        .{
+            .input = .{ .write = .{ .pane_id = 0, .data = "x" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expectEqual(6, v.command_queue.len());
+                }
+            }).check,
+        },
+        // Drain the pane setup commands. The write is sent as the last of
+        // them completes.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .check_command = (struct {
+                fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    try testing.expectEqualStrings(
+                        "send-keys -H -t %0 78\n",
+                        command,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
+test "write to an unknown pane is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // Initial startup
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 1,
+                .name = "test",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        // Only pane 0 exists.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                ,
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // Pane 7 was never in a layout, so there is nothing to send to.
+        // Queueing it would make tmux error on an unknown target.
+        .{
+            .input = .{ .write = .{ .pane_id = 7, .data = "x" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // An empty write has nothing to send either. Without this guard
+        // we would emit a bare `send-keys`, which tmux reads as "send the
+        // key this command is bound to".
+        .{
+            .input = .{ .write = .{ .pane_id = 0, .data = "" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
+
+test "write before startup completes is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        // We are still in startup_block: no session, no panes.
+        .{
+            .input = .{ .write = .{ .pane_id = 0, .data = "x" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
         },
     });
 }
