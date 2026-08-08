@@ -2769,11 +2769,24 @@ fn expectMirrored(expected: *Terminal, actual: *Terminal) !void {
         try testing.expectEqualStrings(want, got);
     }
 
-    const want_cursor = expected.screens.active.cursor;
-    const got_cursor = actual.screens.active.cursor;
-    try testing.expectEqual(want_cursor.x, got_cursor.x);
-    try testing.expectEqual(want_cursor.y, got_cursor.y);
-    try testing.expectEqual(want_cursor.cursor_style, got_cursor.cursor_style);
+    // Both screens, not just the active one. The cursor of the screen
+    // that is *not* active is the state a byte stream can never carry,
+    // so it is the whole reason the sink sends operations.
+    inline for (.{ .primary, .alternate }) |key| {
+        const want_screen = expected.screens.get(key);
+        const got_screen = actual.screens.get(key);
+        try testing.expectEqual(want_screen == null, got_screen == null);
+
+        if (want_screen) |want| {
+            const got = got_screen.?;
+            try testing.expectEqual(want.cursor.x, got.cursor.x);
+            try testing.expectEqual(want.cursor.y, got.cursor.y);
+            try testing.expectEqual(
+                want.cursor.cursor_style,
+                got.cursor.cursor_style,
+            );
+        }
+    }
 
     try testing.expectEqual(
         expected.scrolling_region.top,
@@ -2879,10 +2892,13 @@ test "attached sink mirrors the pane terminal" {
         .{ .input = .{ .tmux = .{ .block_end = "visible line" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
-        // pane_state: cursor at (7,2), origin+insert on, scroll region 1-40.
+        // pane_state: the pane is on the primary screen with its cursor
+        // at (7,2), and the *alternate* screen has a saved cursor at
+        // (5,3). That alternate cursor is the case a byte stream cannot
+        // express, since bytes only ever reach the active screen.
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\%0;7;2;1;bar;;;0;4294967295;4294967295;1;1;0;0;1;0;0;0;0;0;0;;;1;40;8,16,24
+            \\%0;7;2;1;bar;;;0;5;3;1;1;0;0;1;0;0;0;0;0;0;;;1;40;8,16,24
             ,
         } } },
         // Then live output, including a sequence split across two
@@ -2898,6 +2914,14 @@ test "attached sink mirrors the pane terminal" {
     });
 
     const pane: *Viewer.Pane = viewer.panes.getEntry(0).?.value_ptr.*;
+
+    // Pin the inactive screen's cursor to a distinctive value first, so
+    // the mirror comparison below is not two zeroes agreeing.
+    try testing.expectEqual(.primary, pane.terminal.screens.active_key);
+    const alt = pane.terminal.screens.get(.alternate).?;
+    try testing.expectEqual(5, alt.cursor.x);
+    try testing.expectEqual(3, alt.cursor.y);
+
     try expectMirrored(&pane.terminal, &mirror.terminal);
 
     // Sanity: the replay actually did something, so the comparison above
