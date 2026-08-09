@@ -298,6 +298,15 @@ pub const Viewer = struct {
         layout_arena: ArenaAllocator.State,
         layout: Layout,
 
+        /// The last size we asked tmux to make this window. Like a pane's
+        /// request this is what we asked for, not what tmux settled on, so
+        /// that a clamped request is not re-sent forever. See
+        /// `windowResizeCommand`.
+        last_size_request: ?struct {
+            cols: usize,
+            rows: usize,
+        } = null,
+
         pub fn deinit(self: *Window, alloc: Allocator) void {
             self.layout_arena.promote(alloc).deinit();
         }
@@ -329,9 +338,28 @@ pub const Viewer = struct {
         /// attached. See `attachPane`.
         sink: ?Sink = null,
 
-        /// The last size we asked tmux to make this pane. See
-        /// `nextResize` for why this is the request and not the result.
+        /// The size this pane is asking for and has not been given.
+        ///
+        /// Used by `composeLayoutSize` to work out how big the window has
+        /// to be. Cleared as soon as tmux answers with a layout, because
+        /// from then on tmux's size is the truth about this pane and a
+        /// spent request would compose a stale window for a sibling.
         last_resize_request: ?struct {
+            cols: usize,
+            rows: usize,
+        } = null,
+
+        /// The last size we actually asked tmux for.
+        ///
+        /// Deliberately separate from `last_resize_request`, and
+        /// deliberately never cleared by tmux: a resize is a request and
+        /// the layout is the ruling, so tmux is free to answer with
+        /// something else. When it does, the surface has not moved and
+        /// asks for the same size again -- and because every resize is
+        /// answered with a layout, re-sending it is not one wasted round
+        /// trip but a loop with no end. This remembers the question we
+        /// already had answered so we do not ask it again.
+        last_resize_sent: ?struct {
             cols: usize,
             rows: usize,
         } = null,
@@ -359,6 +387,7 @@ pub const Viewer = struct {
             // memory and every field is assigned by hand, so anything left
             // out keeps whatever was in the allocation.
             self.last_resize_request = null;
+            self.last_resize_sent = null;
 
             return self;
         }
@@ -437,6 +466,11 @@ pub const Viewer = struct {
 
     /// Ask tmux to resize a pane.
     ///
+    /// Two things can need to change, because a pane can never be larger
+    /// than the tmux window holding it: the window's size, and the pane's
+    /// share of that window. A pane that is alone in its window only needs
+    /// the first, since it always fills whatever the window is.
+    ///
     /// Deduplicated against the last size we asked for, not against the
     /// pane's current size: tmux clamps a resize to what the layout allows,
     /// so comparing against the result would make us re-send the same
@@ -450,19 +484,211 @@ pub const Viewer = struct {
             return &.{};
         }).value_ptr.*;
 
-        if (pane.last_resize_request) |last| {
+        // Against what we last sent, not what the pane is still asking
+        // for: tmux clears the request when it answers, and the answer is
+        // often not what we asked for.
+        if (pane.last_resize_sent) |last| {
             if (last.cols == r.cols and last.rows == r.rows) return &.{};
         }
+        pane.last_resize_sent = .{ .cols = r.cols, .rows = r.rows };
         pane.last_resize_request = .{ .cols = r.cols, .rows = r.rows };
 
-        return self.queueUserCommand("resize-pane -t %{d} -x {d} -y {d}\n", .{
-            r.pane_id,
-            r.cols,
-            r.rows,
-        }) catch {
-            log.warn("failed to queue resize for pane id={}", .{r.pane_id});
+        return self.queueResize(r) catch |err| {
+            log.warn(
+                "failed to queue resize for pane id={} err={}",
+                .{ r.pane_id, err },
+            );
             return &.{};
         };
+    }
+
+    fn queueResize(
+        self: *Viewer,
+        r: Input.Resize,
+    ) Allocator.Error![]const Action {
+        var commands: [2]Command = undefined;
+        var count: usize = 0;
+        errdefer for (commands[0..count]) |c| c.deinit(self.alloc);
+
+        // The window first: growing a pane into space the window does not
+        // have yet would just be clamped away.
+        var pane_needed = true;
+        if (try self.windowResizeCommand(r.pane_id)) |result| {
+            if (result.command) |c| {
+                commands[count] = c;
+                count += 1;
+
+                // A lone pane is its window, so `resize-pane` could only
+                // ask for the size we just asked for.
+                if (result.only_pane_in_window) pane_needed = false;
+            }
+        }
+
+        if (pane_needed) {
+            commands[count] = try self.userCommand(
+                "resize-pane -t %{d} -x {d} -y {d}\n",
+                .{ r.pane_id, r.cols, r.rows },
+            );
+            count += 1;
+        }
+
+        // Ownership passes to the queue, success or not.
+        const n = count;
+        count = 0;
+        return self.queueUserCommands(commands[0..n]);
+    }
+
+    const WindowResize = struct {
+        /// Null when the window is already the size we want, or when tmux
+        /// is too old to be told.
+        command: ?Command,
+        only_pane_in_window: bool,
+    };
+
+    /// Build the command that sizes the tmux window holding `pane_id`.
+    ///
+    /// tmux lays every window out inside its client's size, so a control
+    /// client that reports one size gets one size for all of its windows.
+    /// That is wrong for us: each tmux window is its own native window and
+    /// has its own size. `refresh-client -C @id:WxH` sets a per-window size
+    /// that `clients_calculate_size` uses in place of the client's own for
+    /// that window (see tmux's resize.c), which is exactly what we want.
+    ///
+    /// The size comes from the panes rather than from the apprt, because
+    /// the viewer is what knows the layout: composing the panes' requested
+    /// sizes the same way tmux composes a layout gives the size the native
+    /// window is asking for, dividers included.
+    ///
+    /// Returns null if the pane is in no window we know about.
+    fn windowResizeCommand(
+        self: *Viewer,
+        pane_id: usize,
+    ) Allocator.Error!?WindowResize {
+        const window: *Window = self.windowForPane(pane_id) orelse return null;
+        const want = composeLayoutSize(&self.panes, window.layout);
+        const only = window.layout.content == .pane;
+
+        if (window.last_size_request) |last| {
+            if (last.cols == want.cols and last.rows == want.rows) {
+                return .{ .command = null, .only_pane_in_window = only };
+            }
+        }
+
+        window.last_size_request = .{ .cols = want.cols, .rows = want.rows };
+
+        // Per-window sizes through `refresh-client -C @id:WxH` landed in
+        // tmux 3.4. An older server parses that argument as a plain size,
+        // fails, and answers with an error, so it gets `resize-window`
+        // instead -- which is what iTerm2 does, and which reaches the
+        // same place by a blunter route: it pins the window's size by
+        // setting `window-size` to manual for it, a server side change
+        // that outlives us. Worth it, because the alternative is a window
+        // stuck at whatever size the host surface happens to be.
+        const command = if (self.tmuxVersionAtLeast(3, 4))
+            try self.userCommand(
+                "refresh-client -C @{d}:{d}x{d}\n",
+                .{ window.id, want.cols, want.rows },
+            )
+        else
+            try self.userCommand(
+                "resize-window -x {d} -y {d} -t @{d}\n",
+                .{ want.cols, want.rows, window.id },
+            );
+
+        return .{
+            .command = command,
+            .only_pane_in_window = only,
+        };
+    }
+
+    /// The window containing the given pane, if any.
+    fn windowForPane(self: *Viewer, pane_id: usize) ?*Window {
+        for (self.windows.items) |*window| {
+            if (layoutContainsPane(window.layout, pane_id)) return window;
+        }
+        return null;
+    }
+
+    fn layoutContainsPane(node: Layout, pane_id: usize) bool {
+        return switch (node.content) {
+            .pane => |id| id == pane_id,
+            .horizontal, .vertical => |children| for (children) |child| {
+                if (layoutContainsPane(child, pane_id)) break true;
+            } else false,
+        };
+    }
+
+    /// The size a layout would need to hold every pane at the size that
+    /// pane last asked for, falling back to the size tmux gave it.
+    ///
+    /// This is tmux's own composition: a split costs one cell for the
+    /// divider between each pair of children, and the other axis is the
+    /// largest child. See `layout_fix_offsets` in tmux's layout.c.
+    fn composeLayoutSize(
+        panes: *const PanesMap,
+        node: Layout,
+    ) struct { cols: usize, rows: usize } {
+        switch (node.content) {
+            .pane => |id| {
+                if (panes.get(id)) |pane| {
+                    if (pane.last_resize_request) |r| {
+                        return .{ .cols = r.cols, .rows = r.rows };
+                    }
+                }
+                return .{ .cols = node.width, .rows = node.height };
+            },
+
+            .horizontal => |children| {
+                var cols: usize = children.len -| 1;
+                var rows: usize = 0;
+                for (children) |child| {
+                    const child_size = composeLayoutSize(panes, child);
+                    cols += child_size.cols;
+                    rows = @max(rows, child_size.rows);
+                }
+                return .{ .cols = cols, .rows = rows };
+            },
+
+            .vertical => |children| {
+                var cols: usize = 0;
+                var rows: usize = children.len -| 1;
+                for (children) |child| {
+                    const child_size = composeLayoutSize(panes, child);
+                    cols = @max(cols, child_size.cols);
+                    rows += child_size.rows;
+                }
+                return .{ .cols = cols, .rows = rows };
+            },
+        }
+    }
+
+    /// Whether the tmux we are talking to is at least the given version.
+    ///
+    /// tmux reports versions like `3.5a`, where the letter is a bug-fix
+    /// release, so only the leading `major.minor` is compared. An
+    /// unparseable version answers false: a feature we cannot confirm is
+    /// a feature we do not use.
+    fn tmuxVersionAtLeast(self: *const Viewer, major: usize, minor: usize) bool {
+        var it = std.mem.splitScalar(u8, self.tmux_version, '.');
+        const major_str = it.next() orelse return false;
+        const minor_str = it.next() orelse return false;
+
+        const got_major = std.fmt.parseInt(usize, major_str, 10) catch
+            return false;
+
+        // Trim any bug-fix letter, e.g. the `a` of `3.5a`.
+        const digits = end: {
+            var end: usize = 0;
+            while (end < minor_str.len and std.ascii.isDigit(minor_str[end])) {
+                end += 1;
+            }
+            break :end minor_str[0..end];
+        };
+        const got_minor = std.fmt.parseInt(usize, digits, 10) catch
+            return false;
+
+        if (got_major != major) return got_major > major;
+        return got_minor >= minor;
     }
 
     /// Tell tmux the size of our control mode client.
@@ -512,7 +738,33 @@ pub const Viewer = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) Allocator.Error![]const Action {
+        // queueUserCommands takes ownership whether it succeeds or not.
+        return self.queueUserCommands(&.{try self.userCommand(fmt, args)});
+    }
+
+    /// Build a user command from a format string. The caller owns it
+    /// until it is handed to `queueUserCommands`.
+    fn userCommand(
+        self: *Viewer,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) Allocator.Error!Command {
+        var builder: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer builder.deinit();
+        builder.writer.print(fmt, args) catch return error.OutOfMemory;
+        return .{ .user = try builder.toOwnedSlice() };
+    }
+
+    /// Queue commands, returning the action that sends the first of them
+    /// if nothing was already in flight. Ownership of `commands` passes to
+    /// the queue whether this succeeds or not.
+    fn queueUserCommands(
+        self: *Viewer,
+        commands: []const Command,
+    ) Allocator.Error![]const Action {
         assert(self.state == .command_queue);
+        assert(commands.len > 0);
+        errdefer for (commands) |c| c.deinit(self.alloc);
 
         // Clear our prior arena so it is ready to be used for any
         // actions immediately.
@@ -520,27 +772,19 @@ pub const Viewer = struct {
         defer self.action_arena = arena.state;
         _ = arena.reset(.free_all);
 
-        const command: Command = command: {
-            var builder: std.Io.Writer.Allocating = .init(self.alloc);
-            errdefer builder.deinit();
-            builder.writer.print(fmt, args) catch return error.OutOfMemory;
-            break :command .{ .user = try builder.toOwnedSlice() };
-        };
-        errdefer command.deinit(self.alloc);
-
-        // If a command is already in flight then ours is sent later, when
-        // that one completes (see the tail of `nextCommand`).
+        // If a command is already in flight then ours are sent later, as
+        // each one ahead completes (see the tail of `nextCommand`).
         const was_empty = self.command_queue.empty();
         const action: ?Action = if (was_empty) action: {
             var builder: std.Io.Writer.Allocating = .init(arena.allocator());
-            command.formatCommand(&builder.writer) catch
+            commands[0].formatCommand(&builder.writer) catch
                 return error.OutOfMemory;
             break :action .{ .command = builder.writer.buffered() };
         } else null;
 
         // Must be the last fallible operation: past this point the queue
-        // owns `command` and our errdefer would double free it.
-        try self.queueCommands(&.{command});
+        // owns the commands and our errdefer would double free them.
+        try self.queueCommands(commands);
 
         return if (action) |a| self.singleAction(a) else &.{};
     }
@@ -1427,6 +1671,17 @@ pub const Viewer = struct {
                             .cols = cols,
                             .rows = rows,
                         });
+
+                        // Whatever we last asked for, this is the answer,
+                        // so forget the request. Leaving it would let a
+                        // stale one shrink the window back through
+                        // `composeLayoutSize` if a sibling resizes before
+                        // this pane's surface has caught up.
+                        //
+                        // `last_resize_sent` deliberately survives this.
+                        // It is what stops us asking the same question
+                        // again once tmux has answered it.
+                        pane.last_resize_request = null;
 
                         // Anything mirroring this pane has to resize too.
                         // A consumer that owns a surface should route this
@@ -3011,6 +3266,35 @@ fn testSinglePaneSteps() []const TestStep {
     };
 }
 
+const two_panes_vertical = "027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]";
+const two_panes_horizontal = "1c1b,83x44,0,0{41x44,0,0,0,41x44,42,0,1}";
+
+/// Startup for a two-pane window with the given layout.
+///
+/// `vertical` stacks panes 0 (83x20) and 1 (83x23) top to bottom;
+/// `horizontal` puts panes 0 and 1 (41x44 each) side by side. Either way
+/// the divider between them makes the window 83x44.
+fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
+    return &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "$0 @0 83 44 " ++ layout } } },
+        // Four capture-pane replies per pane.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    };
+}
+
 test "pane state maps tmux mouse flags to the right modes" {
     var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
@@ -3126,7 +3410,7 @@ test "sink is closed when its pane goes away" {
     try testing.expect(mirror.closed);
 }
 
-test "resize asks tmux to resize the pane" {
+test "resizing a lone pane resizes its window" {
     var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
 
@@ -3144,13 +3428,21 @@ test "resize asks tmux to resize the pane" {
         // Drain the pane_state reply so the command queue is empty and
         // our command is sent immediately rather than queued behind it.
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // A pane that is alone fills its window, so sizing the window is
+        // the whole job: nothing is queued behind this.
         .{
             .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
-            .contains_command = "resize-pane -t %0 -x 100 -y 30\n",
+            .contains_command = "refresh-client -C @0:100x30\n",
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
         },
-        // Drain the resize reply, so the queue is empty again and a
-        // command that is not deduplicated would be sent immediately.
-        // Without that, "no action" would prove nothing.
+        // Drain the reply, so the queue is empty again and a command that
+        // is not deduplicated would be sent immediately. Without that,
+        // "no action" would prove nothing.
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
 
         // The same size again is not worth a round trip.
@@ -3166,7 +3458,7 @@ test "resize asks tmux to resize the pane" {
         // A different size is.
         .{
             .input = .{ .resize = .{ .pane_id = 0, .cols = 90, .rows = 30 } },
-            .contains_command = "resize-pane -t %0 -x 90 -y 30\n",
+            .contains_command = "refresh-client -C @0:90x30\n",
         },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         // Unknown panes and degenerate sizes are dropped.
@@ -3187,6 +3479,242 @@ test "resize asks tmux to resize the pane" {
             }).check,
         },
     });
+}
+
+test "resizing a split pane sizes both the window and the pane" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 0 grows from 83x20 to 90x25. Pane 1 has not been heard
+        // from, so it still counts as the 83x23 tmux gave it: the window
+        // composes to max(90, 83) x (25 + 23 + 1).
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 90, .rows = 25 } },
+            .contains_command = "refresh-client -C @0:90x49\n",
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    // The window command goes first, because a pane can
+                    // never grow past its window. The pane command is
+                    // queued behind it.
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(2, v.command_queue.len());
+                }
+            }).check,
+        },
+        // The window reply lets the queued pane resize go out.
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "resize-pane -t %0 -x 90 -y 25\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Now pane 1 catches up. The window recomposes to 90x(25+30+1).
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 90, .rows = 30 } },
+            .contains_command = "refresh-client -C @0:90x56\n",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "resize-pane -t %1 -x 90 -y 30\n",
+        },
+    });
+}
+
+test "a side-by-side split composes across the other axis" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_horizontal));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 0 widens from 41 to 50. Pane 1 is still the 41 tmux gave
+        // it, so the window wants 50 + 41 + the divider, and the height is
+        // the taller of the two rather than their sum.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 50, .rows = 44 } },
+            .contains_command = "refresh-client -C @0:92x44\n",
+        },
+    });
+}
+
+test "a window is only resized when its own size changes" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Each pane asks for the size it already has, which is the first
+        // time either has asked for anything. The window is unchanged at
+        // 83x44, but we have never told tmux that, so we do.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 20 } },
+            .contains_command = "refresh-client -C @0:83x44\n",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "" } },
+            .contains_command = "resize-pane -t %0 -x 83 -y 20\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 1 now asks for its own current size. That is new for the
+        // pane but composes to the same 83x44, so only the pane command
+        // goes out.
+        .{
+            .input = .{ .resize = .{ .pane_id = 1, .cols = 83, .rows = 23 } },
+            .contains_command = "resize-pane -t %1 -x 83 -y 23\n",
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
+        },
+    });
+}
+
+test "tmux resizing a pane forgets what we asked for" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .resize = .{ .pane_id = 0, .cols = 83, .rows = 25 } } },
+    });
+
+    const pane: *Viewer.Pane = viewer.panes.getEntry(0).?.value_ptr.*;
+    try testing.expect(pane.last_resize_request != null);
+
+    // tmux answers with a layout that sizes pane 0 differently. That is
+    // the answer to our request, so the request is spent: keeping it would
+    // let it compose a stale window size for a sibling's resize later.
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .layout_change = .{
+            .window_id = 0,
+            .layout = "19fb,83x44,0,0[83x30,0,0,0,83x13,0,31,1]",
+            .visible_layout = "19fb,83x44,0,0[83x30,0,0,0,83x13,0,31,1]",
+            .raw_flags = "*",
+        } } } },
+    });
+
+    try testing.expectEqual(30, pane.terminal.rows);
+    try testing.expectEqual(null, pane.last_resize_request);
+}
+
+test "a size tmux will not give us is not asked for twice" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Ask for a size.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .contains_command = "refresh-client -C @0:100x30\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // tmux answers with something else. It is entitled to: a resize
+        // is a request, and the layout is the ruling.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = "a69d,90x40,0,0,0",
+                .visible_layout = "a69d,90x40,0,0,0",
+                .raw_flags = "*",
+            } } },
+        },
+
+        // The surface has not moved, so it asks for the same size again.
+        // Asking tmux again would be asking a question we have already
+        // had answered, and since tmux replies to every resize with a
+        // layout, doing so is not one wasted round trip but a loop that
+        // never ends.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        try testing.expect(action != .command);
+                    }
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
+
+test "an old tmux sizes windows the old way" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        // Per-window sizes arrived in tmux 3.4.
+        .{ .input = .{ .tmux = .{ .block_end = "3.3a" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\$0 @0 83 44 b7dd,83x44,0,0,0
+            ,
+        } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // `refresh-client -C @id:WxH` does not exist before 3.4, so the
+        // window is sized with resize-window instead. It is still a lone
+        // pane, so that is the whole job.
+        .{
+            .input = .{ .resize = .{ .pane_id = 0, .cols = 100, .rows = 30 } },
+            .contains_command = "resize-window -x 100 -y 30 -t @0\n",
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(1, actions.len);
+                    try testing.expectEqual(1, v.command_queue.len());
+                }
+            }).check,
+        },
+    });
+}
+
+test "tmux version comparison" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    const cases = .{
+        .{ "3.4", true },
+        .{ "3.5a", true },
+        .{ "4.0", true },
+        .{ "3.10", true },
+        .{ "3.3a", false },
+        .{ "2.9", false },
+        // Nothing we can read is nothing we can rely on.
+        .{ "next", false },
+        .{ "", false },
+        .{ "3.x", false },
+    };
+
+    inline for (cases) |case| {
+        viewer.alloc.free(viewer.tmux_version);
+        viewer.tmux_version = try viewer.alloc.dupe(u8, case[0]);
+        try testing.expectEqual(case[1], viewer.tmuxVersionAtLeast(3, 4));
+    }
 }
 
 test "client size is reported to tmux once" {
