@@ -16,4 +16,7 @@ pub const Sink = sink.Sink;
 
 test {
     @import("std").testing.refAllDecls(@This());
+
+    // Skipped unless `zig build test-tmux-live` asked for them.
+    _ = @import("tmux/live.zig");
 }
