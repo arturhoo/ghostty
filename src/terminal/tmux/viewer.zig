@@ -1053,12 +1053,21 @@ pub const Viewer = struct {
         _ = try t.switchScreen(screen_key);
         const screen: *Screen = t.screens.active;
 
-        // Get a VT stream from the terminal so we can send data as-is into
-        // it. This will populate the active area too so it won't be exactly
+        // Get a VT stream from the terminal so we can send data into it.
+        // This will populate the active area too so it won't be exactly
         // correct but we'll get the active contents soon.
+        //
+        // The captures ask tmux to escape everything non-printable so that
+        // no raw ESC ever reaches the DCS carrying control mode, so the
+        // escape sequences `-e` asked for arrive as text and have to be
+        // turned back into bytes here. A block payload is const, unlike an
+        // %output payload, so this decodes into a scratch buffer; decoding
+        // never grows the input, so the reply's own length is enough room.
+        const buf = try self.alloc.alloc(u8, content.len);
+        defer self.alloc.free(buf);
         var stream = t.vtStream();
         defer stream.deinit();
-        stream.nextSlice(content);
+        stream.nextSlice(control.unescape(buf, content));
 
         // Populate the active area to be empty since this is only history.
         // We'll fill it with blanks and move the cursor to the top-left.
@@ -1097,9 +1106,11 @@ pub const Viewer = struct {
         t.eraseDisplay(.complete, false);
         t.setCursorPos(1, 1);
 
+        const buf = try self.alloc.alloc(u8, content.len);
+        defer self.alloc.free(buf);
         var stream = t.vtStream();
         defer stream.deinit();
-        stream.nextSlice(content);
+        stream.nextSlice(control.unescape(buf, content));
     }
 
     fn receivedOutput(
@@ -1308,13 +1319,18 @@ const Command = union(enum) {
             .pane_history => |cap| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
+                // -C = escape non-printable bytes as octal. Mandatory
+                //   alongside -e: a reply travels inside a %begin/%end
+                //   block, and unlike %output tmux does not escape block
+                //   payloads, so a raw ESC would terminate the DCS that
+                //   carries control mode and drop us out of the session.
                 // -a = capture alternate screen (only valid for alternate)
                 // -q = quiet, don't error if alternate screen doesn't exist
                 // -S - = start at the top of history ("-")
                 // -E -1 = end at the last line of history (1 before the
                 //   visible area is -1).
                 // -t %{d} = target a specific pane ID
-                "capture-pane -p -e -q {s}-S - -E -1 -t %{d}\n",
+                "capture-pane -p -e -C -q {s}-S - -E -1 -t %{d}\n",
                 .{
                     if (cap.screen_key == .alternate) "-a " else "",
                     cap.id,
@@ -1324,11 +1340,12 @@ const Command = union(enum) {
             .pane_visible => |cap| try writer.print(
                 // -p = output to stdout instead of buffer
                 // -e = output escape sequences for SGR
+                // -C = escape non-printable bytes as octal (see above)
                 // -a = capture alternate screen (only valid for alternate)
                 // -q = quiet, don't error if alternate screen doesn't exist
                 // -t %{d} = target a specific pane ID
                 // (no -S/-E = capture visible area only)
-                "capture-pane -p -e -q {s}-t %{d}\n",
+                "capture-pane -p -e -C -q {s}-t %{d}\n",
                 .{
                     if (cap.screen_key == .alternate) "-a " else "",
                     cap.id,
@@ -1788,6 +1805,73 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .exit },
             .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "capture replay decodes escaped escape sequences" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 42,
+            .name = "main",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        // One pane, so the first capture is pane_history for pane 0. The
+        // captures must ask tmux to escape what it sends: a raw ESC in a
+        // block payload would end the control mode DCS.
+        .{
+            .input = .{ .tmux = .{
+                .block_end =
+                \\$0 @0 80 24 b25d,80x24,0,0,0
+                ,
+            } },
+            .check_command = (struct {
+                fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-C"));
+                }
+            }).check,
+        },
+        // The history response, escaped the same way. Moves us on to
+        // pane_visible.
+        .{
+            .input = .{ .tmux = .{ .block_end = "\\033[32mOLD" } },
+            .check_command = (struct {
+                fn check(_: *Viewer, command: []const u8) anyerror!void {
+                    try testing.expect(std.mem.containsAtLeast(u8, command, 1, "-C"));
+                }
+            }).check,
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .history = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expectEqualStrings("OLD", str);
+                }
+            }).check,
+        },
+        // The visible response, as tmux escapes it under `-e -C`.
+        .{
+            .input = .{ .tmux = .{ .block_end = "\\033[31mRED" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const screen: *Screen = pane.terminal.screens.active;
+                    const str = try screen.dumpStringAlloc(
+                        testing.allocator,
+                        .{ .active = .{} },
+                    );
+                    defer testing.allocator.free(str);
+                    try testing.expectEqualStrings("RED", str);
+                }
+            }).check,
         },
     });
 }
