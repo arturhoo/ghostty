@@ -183,56 +183,6 @@ pub const Parser = struct {
         return terminator;
     }
 
-    /// Decode the escaping tmux applies to pane output.
-    ///
-    /// tmux writes any byte below a space, and the backslash itself, as a
-    /// backslash and three octal digits; everything else goes out as-is,
-    /// so UTF-8 and other high bytes arrive untouched. See
-    /// `control_write_pane_output` in tmux's control.c.
-    ///
-    /// The decoded form is never longer than what came in, so this
-    /// rewrites the slice in place and returns the shorter result. That
-    /// keeps the data pointing into the parser's own buffer, which is
-    /// where the caller expects it to live.
-    fn unescapeOutput(data: []u8) []u8 {
-        var w: usize = 0;
-        var r: usize = 0;
-
-        while (r < data.len) {
-            // Anything that cannot be a complete escape is just a byte.
-            if (data[r] != '\\' or r + 4 > data.len) {
-                data[w] = data[r];
-                w += 1;
-                r += 1;
-                continue;
-            }
-
-            const decoded: ?u8 = decoded: {
-                var value: u16 = 0;
-                for (data[r + 1 ..][0..3]) |c| {
-                    if (c < '0' or c > '7') break :decoded null;
-                    value = value * 8 + (c - '0');
-                }
-                break :decoded std.math.cast(u8, value);
-            };
-
-            // Not an escape tmux would have written, so leave the
-            // backslash alone rather than swallowing what follows it.
-            const byte = decoded orelse {
-                data[w] = data[r];
-                w += 1;
-                r += 1;
-                continue;
-            };
-
-            data[w] = byte;
-            w += 1;
-            r += 4;
-        }
-
-        return data[0..w];
-    }
-
     fn parseNotification(self: *Parser) ParseError!?Notification {
         assert(self.state == .notification);
 
@@ -286,9 +236,10 @@ pub const Parser = struct {
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
             ) catch unreachable;
-            const data = unescapeOutput(
-                line[@intCast(starts[2])..@intCast(ends[2])],
-            );
+            const data = data: {
+                const raw = line[@intCast(starts[2])..@intCast(ends[2])];
+                break :data unescape(raw, raw);
+            };
 
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
@@ -543,6 +494,78 @@ pub const Parser = struct {
         self.buffer.deinit();
     }
 };
+
+/// Decode the escaping tmux applies to text it can't send raw.
+///
+/// Two places need this and they use slightly different dialects of the
+/// same encoding:
+///
+///   * `%output` payloads, where `control_write_pane_output` in tmux's
+///     control.c writes any byte below a space, and the backslash itself,
+///     as a backslash and three octal digits.
+///   * `capture-pane -C` replies, where `grid_string_cells` in grid.c
+///     writes escape sequences the same way (`\033[`, `\016`, `\017`) but
+///     writes a literal backslash as a doubled backslash.
+///
+/// Decoding both here means neither caller has to care which it has. The
+/// dialects can't collide: %output never emits a doubled backslash
+/// because it octal-escapes that byte too.
+///
+/// Everything else passes through, so UTF-8 and other high bytes are
+/// untouched.
+///
+/// The decoded form is never longer than what came in, so `dst` may alias
+/// `src` to decode in place. Callers holding a mutable slice do exactly
+/// that, which keeps the data pointing into the parser's own buffer.
+pub fn unescape(dst: []u8, src: []const u8) []u8 {
+    assert(dst.len >= src.len);
+
+    var w: usize = 0;
+    var r: usize = 0;
+
+    while (r < src.len) {
+        // Anything that cannot begin an escape is just a byte.
+        if (src[r] != '\\' or r + 2 > src.len) {
+            dst[w] = src[r];
+            w += 1;
+            r += 1;
+            continue;
+        }
+
+        // A doubled backslash is one backslash.
+        if (src[r + 1] == '\\') {
+            dst[w] = '\\';
+            w += 1;
+            r += 2;
+            continue;
+        }
+
+        const decoded: ?u8 = decoded: {
+            if (r + 4 > src.len) break :decoded null;
+            var value: u16 = 0;
+            for (src[r + 1 ..][0..3]) |c| {
+                if (c < '0' or c > '7') break :decoded null;
+                value = value * 8 + (c - '0');
+            }
+            break :decoded std.math.cast(u8, value);
+        };
+
+        // Not an escape tmux would have written, so leave the backslash
+        // alone rather than swallowing what follows it.
+        const byte = decoded orelse {
+            dst[w] = src[r];
+            w += 1;
+            r += 1;
+            continue;
+        };
+
+        dst[w] = byte;
+        w += 1;
+        r += 4;
+    }
+
+    return dst[0..w];
+}
 
 /// Possible notification types from tmux control mode. These are documented
 /// in tmux(1). A lot of the simple documentation was copied from that man
@@ -829,6 +852,23 @@ test "tmux output passes utf8 through" {
     for ("%output %0 caf\u{00e9}") |byte| try testing.expect(try c.put(byte) == null);
     const n = (try c.put('\n')).?;
     try testing.expectEqualStrings("caf\u{00e9}", n.output.data);
+}
+
+test "tmux unescape decodes a doubled backslash" {
+    const testing = std.testing;
+
+    // `capture-pane -C` writes a literal backslash as a doubled backslash
+    // rather than the `\134` that %output uses.
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("a\\b", unescape(&buf, "a\\\\b"));
+}
+
+test "tmux unescape decodes into a separate buffer" {
+    const testing = std.testing;
+
+    // Block payloads are const, so they decode out of place.
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("\x1b[31mX", unescape(&buf, "\\033[31mX"));
 }
 
 test "tmux session-changed" {
