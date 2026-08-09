@@ -82,6 +82,17 @@ pub const Router = struct {
 
             /// The pane's display was closed by the user.
             kill: *const fn (ctx: *anyopaque, pane_id: usize) void,
+
+            /// The GUI asked for a new tab, which for a tmux surface
+            /// means a new tmux window.
+            newWindow: *const fn (ctx: *anyopaque) void,
+
+            /// The GUI asked to split a pane.
+            split: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                horizontal: bool,
+            ) void,
         };
     };
 
@@ -384,6 +395,28 @@ pub const Router = struct {
         self.host.vtable.resize(self.host.ctx, pane_id, cols, rows);
     }
 
+    /// Ask the session for a new window. Not tied to a pane: a new tab
+    /// belongs to the session, and the pane the user happened to be in
+    /// does not narrow it.
+    pub fn newWindow(self: *Router) void {
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.newWindow(self.host.ctx);
+    }
+
+    /// Ask tmux to split a pane. `horizontal` is tmux's sense of the
+    /// word: a new pane to the right, side by side.
+    pub fn splitPane(
+        self: *Router,
+        pane_id: usize,
+        horizontal: bool,
+    ) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.split(self.host.ctx, pane_id, horizontal);
+    }
+
     pub fn killPane(self: *Router, pane_id: usize) void {
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
@@ -450,12 +483,32 @@ const TestHost = struct {
         rows: usize,
     }) = .empty,
     kills: std.ArrayList(usize) = .empty,
+    new_windows: usize = 0,
+    splits: std.ArrayList(struct {
+        pane_id: usize,
+        horizontal: bool,
+    }) = .empty,
 
     const vtable: Router.Host.VTable = .{
         .write = write,
         .resize = resize,
         .kill = kill,
+        .newWindow = newWindow,
+        .split = split,
     };
+
+    fn newWindow(ctx: *anyopaque) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.new_windows += 1;
+    }
+
+    fn split(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.splits.append(self.alloc, .{
+            .pane_id = pane_id,
+            .horizontal = horizontal,
+        }) catch @panic("oom");
+    }
 
     fn host(self: *TestHost) Router.Host {
         return .{ .ctx = self, .vtable = &vtable };
@@ -466,6 +519,7 @@ const TestHost = struct {
         self.writes.deinit(self.alloc);
         self.resizes.deinit(self.alloc);
         self.kills.deinit(self.alloc);
+        self.splits.deinit(self.alloc);
     }
 
     fn write(ctx: *anyopaque, pane_id: usize, data: []const u8) void {

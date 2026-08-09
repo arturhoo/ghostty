@@ -932,3 +932,84 @@ test "live: window names arrive and follow renames" {
     try testing.expect(found);
     try testing.expect(!session.exited);
 }
+
+test "live: a new tab is a new tmux window" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expectEqual(1, session.viewer.windows.items.len);
+
+    try session.input(.new_window);
+
+    // tmux answers with %window-add, which re-lists, which is what makes
+    // the window appear here. Nothing is remembered in between.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // And tmux agrees, rather than us having invented a window.
+    const count = try session.ask(&.{
+        "display-message", "-p", "#{session_windows}",
+    });
+    defer alloc.free(count);
+    try testing.expectEqualStrings("2", std.mem.trim(u8, count, " \r\n"));
+    try testing.expect(!session.exited);
+}
+
+test "live: a split makes a second pane in the same window" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expectEqual(1, session.viewer.panes.count());
+
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .right } });
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Still one window: a split is a pane, not a tab.
+    try testing.expectEqual(1, session.viewer.windows.items.len);
+
+    // Side by side, as asked. tmux reports the layout, so this is its
+    // opinion and not ours: two panes at the same y, different x.
+    const layout = session.viewer.windows.items[0].layout;
+    try testing.expect(layout.content == .horizontal);
+    try testing.expect(!session.exited);
+}
+
+test "live: a downward split stacks the panes" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .down } });
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const layout = session.viewer.windows.items[0].layout;
+    try testing.expect(layout.content == .vertical);
+    try testing.expect(!session.exited);
+}

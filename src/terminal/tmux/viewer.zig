@@ -268,6 +268,13 @@ pub const Viewer = struct {
 
         /// Ask tmux to kill a pane, because the thing displaying it was
         /// closed.
+        /// Ask tmux for a new window in this session, because the GUI
+        /// asked for a new tab.
+        new_window: void,
+
+        /// Ask tmux to split a pane, because the GUI asked for a split.
+        split: Split,
+
         kill_pane: KillPane,
 
         pub const Write = struct {
@@ -284,6 +291,21 @@ pub const Viewer = struct {
         pub const ClientSize = struct {
             cols: usize,
             rows: usize,
+        };
+
+        /// Which way a new pane goes relative to the one being split.
+        /// tmux only has two axes; the apprt resolves "auto" before it
+        /// gets here.
+        pub const Split = struct {
+            pane_id: usize,
+            direction: Direction,
+
+            pub const Direction = enum {
+                /// New pane to the right: tmux's -h.
+                right,
+                /// New pane below: tmux's -v.
+                down,
+            };
         };
 
         pub const KillPane = struct {
@@ -475,6 +497,8 @@ pub const Viewer = struct {
             .write => self.nextWrite(input.write),
             .resize => self.nextResize(input.resize),
             .client_size => self.nextClientSize(input.client_size),
+            .new_window => self.nextNewWindow(),
+            .split => self.nextSplit(input.split),
             .kill_pane => self.nextKillPane(input.kill_pane),
         };
     }
@@ -721,6 +745,48 @@ pub const Viewer = struct {
             c.rows,
         }) catch {
             log.warn("failed to queue client size", .{});
+            return &.{};
+        };
+    }
+
+    /// Ask tmux for a new window.
+    ///
+    /// No target: tmux puts it in the client's session, which is the one
+    /// we are attached to. The `%window-add` that follows is what makes
+    /// it appear here, so nothing needs to be remembered in between.
+    fn nextNewWindow(self: *Viewer) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        return self.queueUserCommand("new-window\n", .{}) catch {
+            log.warn("failed to queue new-window", .{});
+            return &.{};
+        };
+    }
+
+    /// Ask tmux to split a pane.
+    ///
+    /// Targeted explicitly rather than relying on tmux's idea of the
+    /// active pane, which is a different thing from the surface the user
+    /// was looking at when they asked.
+    fn nextSplit(self: *Viewer, split: Input.Split) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        if (!self.panes.contains(split.pane_id)) {
+            log.info(
+                "split of unknown pane id={}, dropping",
+                .{split.pane_id},
+            );
+            return &.{};
+        }
+
+        return self.queueUserCommand("split-window {s} -t %{d}\n", .{
+            switch (split.direction) {
+                .right => "-h",
+                .down => "-v",
+            },
+            split.pane_id,
+        }) catch {
+            log.warn("failed to queue split for pane id={}", .{split.pane_id});
             return &.{};
         };
     }
