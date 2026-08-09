@@ -1964,11 +1964,18 @@ pub const CAPI = struct {
 
     /// Request that the surface split in the given direction.
     export fn ghostty_surface_split(ptr: *Surface, direction: apprt.action.SplitDirection) void {
-        _ = ptr.app.performAction(
-            .{ .surface = &ptr.core_surface },
-            .new_split,
-            direction,
-        ) catch |err| {
+        // Go through the binding action rather than straight to the
+        // apprt. A tmux pane turns this into `split-window` on the tmux
+        // server, and that decision lives in the core surface -- reaching
+        // past it splits locally and puts a shell on the wrong machine.
+        _ = ptr.core_surface.performBindingAction(.{
+            .new_split = switch (direction) {
+                .right => .right,
+                .left => .left,
+                .down => .down,
+                .up => .up,
+            },
+        }) catch |err| {
             log.err("error creating new split err={}", .{err});
             return;
         };

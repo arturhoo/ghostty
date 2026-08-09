@@ -399,6 +399,8 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .write = tmuxHostWrite,
     .resize = tmuxHostResize,
     .kill = tmuxHostKill,
+    .newWindow = tmuxHostNewWindow,
+    .split = tmuxHostSplit,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -447,6 +449,19 @@ fn tmuxHostResize(
         .pane_id = pane_id,
         .cols = cols,
         .rows = rows,
+    } });
+}
+
+fn tmuxHostNewWindow(ctx: *anyopaque) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.new_window);
+}
+
+fn tmuxHostSplit(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .split = .{
+        .pane_id = pane_id,
+        .direction = if (horizontal) .right else .down,
     } });
 }
 
