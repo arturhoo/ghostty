@@ -166,6 +166,7 @@ fn testSet(alloc: Allocator, layout_str: []const u8) !*WindowSet {
 
     var window: Viewer.Window = .{
         .id = 0,
+        .name = "",
         .width = parsed.width,
         .height = parsed.height,
         .layout_arena = arena.state,

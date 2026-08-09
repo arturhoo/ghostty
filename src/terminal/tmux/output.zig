@@ -22,16 +22,27 @@ pub fn parseFormatStruct(
     const fields = @typeInfo(T).@"struct".fields;
     var it = std.mem.splitScalar(u8, str, delimiter);
     var result: T = undefined;
-    inline for (fields) |field| {
-        const part = it.next() orelse return error.MissingEntry;
+
+    // A window name is any valid UTF-8, so it can contain the delimiter
+    // and cannot be split on it. Such a variable is only allowed last,
+    // where "the rest of the line" is unambiguous.
+    const rest_last = fields.len > 0 and
+        @field(Variable, fields[fields.len - 1].name) == .window_name;
+
+    inline for (fields, 0..) |field, i| {
+        const part = if (rest_last and i == fields.len - 1)
+            it.rest()
+        else
+            it.next() orelse return error.MissingEntry;
+
         @field(result, field.name) = Variable.parse(
             @field(Variable, field.name),
             part,
         ) catch return error.FormatError;
     }
 
-    // We should have consumed all parts now.
-    if (it.next() != null) return error.ExtraEntry;
+    // We should have consumed all parts now. `rest` already did.
+    if (!rest_last and it.next() != null) return error.ExtraEntry;
 
     return result;
 }
@@ -152,6 +163,9 @@ pub const Variable = enum {
     version,
     /// Unique window ID prefixed with `@` (e.g., `@0`, `@42`).
     window_id,
+    /// Window name. Any valid UTF-8, spaces included, so this must be the
+    /// last variable in a format: see `parseFormatStruct`.
+    window_name,
     /// Width of window.
     window_width,
     /// Height of window.
@@ -211,6 +225,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_name,
             => value,
         };
     }
@@ -252,6 +267,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_name,
             => []const u8,
         };
     }

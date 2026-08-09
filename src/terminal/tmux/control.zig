@@ -499,6 +499,37 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return null;
+        } else if (std.mem.eql(u8, cmd, "%session-renamed")) cmd: {
+            var re = oni.Regex.init(
+                "^%session-renamed \\$([0-9]+) (.*)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const name = line[@intCast(starts[2])..@intCast(ends[2])];
+
+            // Important: do not clear buffer here since name points to it
+            self.state = .idle;
+            return .{ .session_renamed = .{ .id = id, .name = name } };
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-renamed @([0-9]+) (.+)$",
@@ -799,6 +830,15 @@ pub const Notification = union(enum) {
     /// for a window that was never ours is harmless.
     window_close: struct {
         id: usize,
+    },
+
+    /// Our session was renamed. Nothing depends on the session name yet,
+    /// but it used to land in the unknown-notification bin, and a name
+    /// with a space in it is exactly the sort of line that used to be
+    /// worth worrying about.
+    session_renamed: struct {
+        id: usize,
+        name: []const u8,
     },
 
     /// The window with ID window-id was renamed to name.
@@ -1257,6 +1297,21 @@ test "tmux unlinked-window-close is a window close" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_close);
     try testing.expectEqual(1, n.window_close.id);
+}
+
+test "tmux session-renamed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%session-renamed $3 my session") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .session_renamed);
+    try testing.expectEqual(3, n.session_renamed.id);
+    try testing.expectEqualStrings("my session", n.session_renamed.name);
 }
 
 test "tmux window-renamed" {
