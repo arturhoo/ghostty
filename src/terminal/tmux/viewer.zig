@@ -1149,6 +1149,13 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // A window left this session, by being killed, by its last
+            // pane exiting, or by being moved elsewhere.
+            .window_close => |info| self.windowClose(info.id) catch {
+                log.warn("failed to handle window close, becoming defunct", .{});
+                return self.defunct();
+            },
+
             // The active pane changed. We don't care about this because
             // we handle our own focus.
             .window_pane_changed => {},
@@ -1254,6 +1261,20 @@ pub const Viewer = struct {
 
     /// When a window is added to the session, we need to refresh our window
     /// list to get the new window's information.
+    /// A window we were showing is gone.
+    ///
+    /// Refresh the whole list rather than pruning by hand: `syncLayouts`
+    /// already drops the window, destroys its panes and closes their
+    /// sinks, and doing that in two places is where a lifetime bug would
+    /// live. The cost is one round trip.
+    fn windowClose(
+        self: *Viewer,
+        window_id: usize,
+    ) !void {
+        _ = window_id;
+        try self.queueCommands(&.{.list_windows});
+    }
+
     fn windowAdd(
         self: *Viewer,
         window_id: usize,
