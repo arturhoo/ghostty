@@ -79,8 +79,17 @@ jobs:
       # Spawns a real tmux server and drives control mode against it.
       # Skipped by `zig build test` (they need tmux and they wait on
       # another process), so they only run here. This step is a superset
-      # of the one above: same binary, plus the gated tests.
+      # of `zig build test`: same binary, plus the gated tests.
+      #
+      # This workflow lives only on `main` but runs against feature
+      # branches, and most of them predate the build step, so its absence
+      # has to be a skip rather than a failure. Drop the guard once the
+      # step is on `main`.
       - name: zig build test-tmux-live
         run: |
+          if ! zig build -h 2>&1 | grep -q 'test-tmux-live'; then
+            echo "no test-tmux-live step on this branch, skipping"
+            exit 0
+          fi
           tmux -V
           zig build test-tmux-live -Dapp-runtime=none --summary all
