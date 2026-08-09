@@ -37,6 +37,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const sinkpkg = @import("sink.zig");
 const Op = sinkpkg.Op;
 const Sink = sinkpkg.Sink;
+const KillScope = sinkpkg.KillScope;
 
 const log = std.log.scoped(.terminal_tmux_router);
 
@@ -92,6 +93,14 @@ pub const Router = struct {
                 ctx: *anyopaque,
                 pane_id: usize,
                 horizontal: bool,
+            ) void,
+
+            /// The GUI closed a tab, which for a tmux surface means
+            /// killing tmux windows.
+            killWindows: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                scope: KillScope,
             ) void,
         };
     };
@@ -417,6 +426,18 @@ pub const Router = struct {
         self.host.vtable.split(self.host.ctx, pane_id, horizontal);
     }
 
+    /// Ask tmux to close windows. `pane_id` names the window the user
+    /// acted on; `scope` says which windows go.
+    pub fn killWindows(
+        self: *Router,
+        pane_id: usize,
+        scope: KillScope,
+    ) void {
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.killWindows(self.host.ctx, pane_id, scope);
+    }
+
     pub fn killPane(self: *Router, pane_id: usize) void {
         if (!self.hostAcquire()) return;
         defer self.hostRelease();
@@ -488,6 +509,10 @@ const TestHost = struct {
         pane_id: usize,
         horizontal: bool,
     }) = .empty,
+    window_kills: std.ArrayList(struct {
+        pane_id: usize,
+        scope: KillScope,
+    }) = .empty,
 
     const vtable: Router.Host.VTable = .{
         .write = write,
@@ -495,7 +520,20 @@ const TestHost = struct {
         .kill = kill,
         .newWindow = newWindow,
         .split = split,
+        .killWindows = killWindows,
     };
+
+    fn killWindows(
+        ctx: *anyopaque,
+        pane_id: usize,
+        scope: KillScope,
+    ) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.window_kills.append(self.alloc, .{
+            .pane_id = pane_id,
+            .scope = scope,
+        }) catch @panic("oom");
+    }
 
     fn newWindow(ctx: *anyopaque) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
@@ -520,6 +558,7 @@ const TestHost = struct {
         self.resizes.deinit(self.alloc);
         self.kills.deinit(self.alloc);
         self.splits.deinit(self.alloc);
+        self.window_kills.deinit(self.alloc);
     }
 
     fn write(ctx: *anyopaque, pane_id: usize, data: []const u8) void {

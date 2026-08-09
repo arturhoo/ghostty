@@ -275,6 +275,9 @@ pub const Viewer = struct {
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
+        /// Ask tmux to close windows, because the GUI closed a tab.
+        kill_windows: KillWindows,
+
         kill_pane: KillPane,
 
         pub const Write = struct {
@@ -306,6 +309,16 @@ pub const Viewer = struct {
                 /// New pane below: tmux's -v.
                 down,
             };
+        };
+
+        pub const KillWindows = struct {
+            /// A pane in the window the user acted on. The window is
+            /// found from this rather than passed directly, because a
+            /// surface knows which pane it is and nothing else.
+            pane_id: usize,
+            scope: Scope,
+
+            pub const Scope = sinkpkg.KillScope;
         };
 
         pub const KillPane = struct {
@@ -499,6 +512,7 @@ pub const Viewer = struct {
             .client_size => self.nextClientSize(input.client_size),
             .new_window => self.nextNewWindow(),
             .split => self.nextSplit(input.split),
+            .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
         };
     }
@@ -789,6 +803,70 @@ pub const Viewer = struct {
             log.warn("failed to queue split for pane id={}", .{split.pane_id});
             return &.{};
         };
+    }
+
+    /// Ask tmux to close one or more windows.
+    ///
+    /// Each window is killed by id rather than with `kill-window -a`,
+    /// because "other" and "to the right" are questions about the order
+    /// the viewer holds, and tmux's own `-a` answers a different one: it
+    /// kills everything but the target across the session regardless of
+    /// position.
+    fn nextKillWindows(
+        self: *Viewer,
+        req: Input.KillWindows,
+    ) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        const target = self.windowForPane(req.pane_id) orelse {
+            log.info(
+                "close for pane id={} in no window, dropping",
+                .{req.pane_id},
+            );
+            return &.{};
+        };
+        const target_id = target.id;
+
+        const index: usize = for (self.windows.items, 0..) |w, i| {
+            if (w.id == target_id) break i;
+        } else return &.{};
+
+        return self.queueKills(target_id, index, req.scope) catch |err| {
+            log.warn("failed to queue window close err={}", .{err});
+            return &.{};
+        };
+    }
+
+    fn queueKills(
+        self: *Viewer,
+        target_id: usize,
+        index: usize,
+        scope: Input.KillWindows.Scope,
+    ) Allocator.Error![]const Action {
+        var commands: std.ArrayList(Command) = .empty;
+        defer commands.deinit(self.alloc);
+        errdefer for (commands.items) |c| c.deinit(self.alloc);
+
+        for (self.windows.items, 0..) |w, i| {
+            const wanted = switch (scope) {
+                .this => w.id == target_id,
+                .others => w.id != target_id,
+                .right => i > index,
+            };
+            if (!wanted) continue;
+
+            try commands.append(
+                self.alloc,
+                try self.userCommand("kill-window -t @{d}\n", .{w.id}),
+            );
+        }
+
+        if (commands.items.len == 0) return &.{};
+
+        // Ownership passes to the queue, success or not.
+        const owned = commands.items;
+        commands = .empty;
+        return self.queueUserCommands(owned);
     }
 
     /// Ask tmux to kill a pane.
