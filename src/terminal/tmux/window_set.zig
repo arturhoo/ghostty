@@ -215,6 +215,7 @@ fn testWindow(
     const layout = try Layout.parse(arena.allocator(), layout_str);
     return .{
         .id = id,
+        .name = "",
         .width = width,
         .height = height,
         .layout_arena = arena.state,
