@@ -926,6 +926,9 @@ typedef struct {
 // Node index 0 is the root of the layout tree. `nodes` is never empty.
 typedef struct {
   size_t id;
+  // NUL terminated, never null, owned by the action. An unnamed window
+  // is an empty string.
+  const char* name;
   size_t width;
   size_t height;
   const ghostty_tmux_node_s* nodes;

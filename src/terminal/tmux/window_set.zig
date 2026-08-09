@@ -32,6 +32,11 @@ pub const WindowSet = struct {
         /// The tmux window ID. Stable for the lifetime of a viewer.
         id: usize,
 
+        /// The window's tmux name, NUL terminated so a C caller can use
+        /// it directly. Owned by the set's arena; valid until the set is
+        /// destroyed. Never null: an unnamed window is an empty string.
+        name: [*:0]const u8,
+
         /// The size of the whole window in cells.
         width: usize,
         height: usize,
@@ -135,6 +140,7 @@ pub const WindowSet = struct {
             const owned = try nodes.toOwnedSlice(alloc);
             dst.* = .{
                 .id = src.id,
+                .name = try alloc.dupeZ(u8, src.name),
                 .width = src.width,
                 .height = src.height,
                 .nodes = owned.ptr,
