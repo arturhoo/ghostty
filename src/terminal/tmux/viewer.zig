@@ -994,7 +994,10 @@ pub const Viewer = struct {
             // I don't think this is technically possible (reading the
             // tmux source code), but if we see an exit we can semantically
             // handle this without issue.
-            .exit => return self.defunct(),
+            .exit => |reason| {
+                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
+                return self.defunct();
+            },
 
             // Any begin and end (even error) is fine! Now we wait for
             // session-changed to get the initial session ID. session-changed
@@ -1022,7 +1025,10 @@ pub const Viewer = struct {
         switch (n) {
             .enter => unreachable,
 
-            .exit => return self.defunct(),
+            .exit => |reason| {
+                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
+                return self.defunct();
+            },
 
             .session_changed => |info| {
                 self.session_id = info.id;
@@ -1052,7 +1058,10 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => return self.defunct(),
+            .exit => |reason| {
+                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
+                return self.defunct();
+            },
             else => return &.{},
         }
     }
@@ -1084,7 +1093,10 @@ pub const Viewer = struct {
 
         switch (n) {
             .enter => unreachable,
-            .exit => return self.defunct(),
+            .exit => |reason| {
+                if (reason) |r| log.info("tmux control mode exited: {s}", .{r});
+                return self.defunct();
+            },
 
             inline .block_end,
             .block_err,
@@ -2206,11 +2218,11 @@ test "immediate exit" {
 
     try testViewer(&viewer, &.{
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .check = (struct {
                 fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(0, actions.len);
@@ -2305,7 +2317,7 @@ test "session changed resets state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2486,7 +2498,7 @@ test "initial flow" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2624,7 +2636,7 @@ test "layout change" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2685,7 +2697,7 @@ test "layout_change does not return command when queue not empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2752,7 +2764,7 @@ test "layout_change returns command when queue was empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2813,7 +2825,7 @@ test "window_add queues list_windows when queue empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -2869,7 +2881,7 @@ test "window_add queues list_windows when queue not empty" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -3050,7 +3062,7 @@ test "two pane flow with pane state" {
             }).check,
         },
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
@@ -4111,7 +4123,7 @@ test "sinks are closed when the connection ends" {
 
     try testViewer(&viewer, &.{
         .{
-            .input = .{ .tmux = .exit },
+            .input = .{ .tmux = .{ .exit = null } },
             .contains_tags = &.{.exit},
         },
     });
