@@ -183,6 +183,56 @@ pub const Parser = struct {
         return terminator;
     }
 
+    /// Decode the escaping tmux applies to pane output.
+    ///
+    /// tmux writes any byte below a space, and the backslash itself, as a
+    /// backslash and three octal digits; everything else goes out as-is,
+    /// so UTF-8 and other high bytes arrive untouched. See
+    /// `control_write_pane_output` in tmux's control.c.
+    ///
+    /// The decoded form is never longer than what came in, so this
+    /// rewrites the slice in place and returns the shorter result. That
+    /// keeps the data pointing into the parser's own buffer, which is
+    /// where the caller expects it to live.
+    fn unescapeOutput(data: []u8) []u8 {
+        var w: usize = 0;
+        var r: usize = 0;
+
+        while (r < data.len) {
+            // Anything that cannot be a complete escape is just a byte.
+            if (data[r] != '\\' or r + 4 > data.len) {
+                data[w] = data[r];
+                w += 1;
+                r += 1;
+                continue;
+            }
+
+            const decoded: ?u8 = decoded: {
+                var value: u16 = 0;
+                for (data[r + 1 ..][0..3]) |c| {
+                    if (c < '0' or c > '7') break :decoded null;
+                    value = value * 8 + (c - '0');
+                }
+                break :decoded std.math.cast(u8, value);
+            };
+
+            // Not an escape tmux would have written, so leave the
+            // backslash alone rather than swallowing what follows it.
+            const byte = decoded orelse {
+                data[w] = data[r];
+                w += 1;
+                r += 1;
+                continue;
+            };
+
+            data[w] = byte;
+            w += 1;
+            r += 4;
+        }
+
+        return data[0..w];
+    }
+
     fn parseNotification(self: *Parser) ParseError!?Notification {
         assert(self.state == .notification);
 
@@ -236,7 +286,9 @@ pub const Parser = struct {
                 line[@intCast(starts[1])..@intCast(ends[1])],
                 10,
             ) catch unreachable;
-            const data = line[@intCast(starts[2])..@intCast(ends[2])];
+            const data = unescapeOutput(
+                line[@intCast(starts[2])..@intCast(ends[2])],
+            );
 
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
@@ -722,6 +774,61 @@ test "tmux output" {
     try testing.expect(n == .output);
     try testing.expectEqual(42, n.output.pane_id);
     try testing.expectEqualStrings("foo bar baz", n.output.data);
+}
+
+test "tmux output unescapes control bytes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // How tmux writes a prompt redraw: carriage return, then an erase to
+    // end of line. Every byte below a space arrives as three octal digits.
+    for ("%output %0 a\\015\\033[Kb") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqualStrings("a\r\x1b[Kb", n.output.data);
+}
+
+test "tmux output unescapes a literal backslash" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // A backslash is itself escaped, so it is not mistaken for one.
+    for ("%output %0 a\\134b") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqualStrings("a\\b", n.output.data);
+}
+
+test "tmux output leaves a stray backslash alone" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // Not something tmux emits, but decoding must not eat bytes or run
+    // off the end when it sees one.
+    for ("%output %0 a\\9z b\\01") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqualStrings("a\\9z b\\01", n.output.data);
+}
+
+test "tmux output passes utf8 through" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // tmux only escapes bytes below a space, so high bytes arrive raw.
+    for ("%output %0 caf\u{00e9}") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqualStrings("caf\u{00e9}", n.output.data);
 }
 
 test "tmux session-changed" {
