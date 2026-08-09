@@ -659,6 +659,18 @@ extension Ghostty {
         /// Context for surface creation
         var context: ghostty_surface_context_e = GHOSTTY_SURFACE_CONTEXT_WINDOW
 
+        /// The tmux control mode session this surface displays a pane of,
+        /// instead of running a command. Obtained from
+        /// `ghostty_surface_tmux_router` on the hosting surface; creating a
+        /// surface with this set consumes the reference.
+        ///
+        /// Deliberately not carried by `init(from:)`: an inherited config
+        /// would be a second owner of a reference it never took.
+        var tmuxRouter: UnsafeMutableRawPointer?
+
+        /// The tmux pane id, meaningful only alongside `tmuxRouter`.
+        var tmuxPaneId: Int = 0
+
         init() {}
 
         init(from config: ghostty_surface_config_s) {
@@ -716,6 +728,12 @@ extension Ghostty {
 
             // Set context
             config.context = context
+
+            // A tmux pane displays part of a session hosted by another
+            // surface instead of running a command. The router reference
+            // is consumed by the surface created from this config.
+            config.tmux_router = tmuxRouter
+            config.tmux_pane_id = tmuxPaneId
 
             // Use withCString to ensure strings remain valid for the duration of the closure
             return try workingDirectory.withCString { cWorkingDir in
