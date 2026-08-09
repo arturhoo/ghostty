@@ -102,6 +102,7 @@ class TmuxWindowManager {
                     controller.surfaceTree = tree
                     keepFocusInWindow(window, of: controller, host: host)
                 }
+                setTitle(controller, window.name)
                 continue
             }
 
@@ -126,6 +127,7 @@ class TmuxWindowManager {
                 ghostty: ghostty,
                 tree: tree,
                 parent: tabParent(action.windows, before: index, host: host))
+            setTitle(controller, window.name)
             windows[key] = .init(value: controller)
         }
 
@@ -224,6 +226,20 @@ class TmuxWindowManager {
         guard let window = windows[Key(host: host, id: id)]?.value?.window,
               window.isVisible else { return nil }
         return window
+    }
+
+    /// Show the tmux window's name as the window title.
+    ///
+    /// tmux owns what a tmux window is called, so this goes in as the
+    /// override: the surface titles underneath are the shell's idea of a
+    /// title, which is a different thing. Assigning only on a change
+    /// keeps this off the main thread's work list for the common case
+    /// where tmux re-reports a layout that did not move.
+    private func setTitle(_ controller: TerminalController, _ name: String) {
+        let wanted = name.isEmpty ? nil : name
+        if controller.titleOverride != wanted {
+            controller.titleOverride = wanted
+        }
     }
 
     /// Close the windows for tmux windows that are gone, and forget panes

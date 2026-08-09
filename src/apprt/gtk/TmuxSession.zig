@@ -117,6 +117,12 @@ fn syncWindow(
     window: WindowSet.Window,
 ) !void {
     const tab = try self.tabFor(host, window.id);
+
+    // tmux owns the name of a tmux window, so it goes in as the tab's
+    // override: the surface titles underneath are the shell's idea of a
+    // title, which is not what this tab is.
+    tab.setTitleOverride(std.mem.span(window.name));
+
     const plan = try layout_plan.plan(arena.allocator(), window.nodeSlice());
 
     var tree = try self.buildTree(plan);
