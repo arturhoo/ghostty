@@ -352,6 +352,50 @@ pub const Parser = struct {
             self.buffer.clearRetainingCapacity();
             self.state = .idle;
             return .{ .window_add = .{ .id = id } };
+        } else if (std.mem.eql(u8, cmd, "%window-close") or
+            std.mem.eql(u8, cmd, "%unlinked-window-close"))
+        cmd: {
+            var re = oni.Regex.init(
+                "^%(?:unlinked-)?window-close @([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .window_close = .{ .id = id } };
+        } else if (std.mem.startsWith(u8, cmd, "%unlinked-window-")) {
+            // A window appearing or being renamed somewhere else in the
+            // server. Nothing to show for a window we are not attached
+            // to. Parsed rather than left to the unknown fall-through so
+            // the log stays quiet and the omission reads as deliberate.
+            //
+            // Note this does NOT cover `%unlinked-window-close`, which is
+            // handled above: see the comment on the `window_close`
+            // notification for why that one is ours.
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return null;
         } else if (std.mem.eql(u8, cmd, "%window-renamed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-renamed @([0-9]+) (.+)$",
@@ -617,6 +661,21 @@ pub const Notification = union(enum) {
 
     /// The window with ID window-id was linked to the current session.
     window_add: struct {
+        id: usize,
+    },
+
+    /// The window with ID window-id closed, or left our session. tmux
+    /// suppresses the dying window's `%layout-change`, so this is the
+    /// only word we get that it is gone.
+    ///
+    /// Carries `%unlinked-window-close` as well as `%window-close`.
+    /// `control_window_unlinked_cb` in tmux's control-notify.c picks
+    /// between them by whether the window is still in the client's
+    /// session, and by the time it runs for a window of ours it usually
+    /// is not — killing a window in our own session is observed to send
+    /// the unlinked form. Both mean the same thing to us, and re-listing
+    /// for a window that was never ours is harmless.
+    window_close: struct {
         id: usize,
     },
 
@@ -931,6 +990,54 @@ test "tmux window-add" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_add);
     try testing.expectEqual(14, n.window_add.id);
+}
+
+test "tmux window-close" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%window-close @2") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .window_close);
+    try testing.expectEqual(2, n.window_close.id);
+}
+
+test "tmux unlinked window notifications are ignored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // Not ours to care about, but the parser must stay healthy across
+    // them: a live session gets these whenever anyone else's window
+    // changes.
+    for ("%unlinked-window-add @9") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put('\n') == null);
+    for ("%unlinked-window-renamed @9 other") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put('\n') == null);
+
+    for ("%window-close @3") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqual(3, n.window_close.id);
+}
+
+test "tmux unlinked-window-close is a window close" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // What tmux actually sends when a window in our own session is
+    // killed, because it has already been unlinked by the time the
+    // notification callback runs.
+    for ("%unlinked-window-close @1") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .window_close);
+    try testing.expectEqual(1, n.window_close.id);
 }
 
 test "tmux window-renamed" {

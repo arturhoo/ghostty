@@ -688,3 +688,56 @@ test "live: a flooding pane does not break the session" {
     const style = page.styles.get(page.memory, cell.cell.style_id);
     try testing.expectEqual(@as(u8, 1), style.fg_color.palette);
 }
+
+test "live: killing a tmux window drops it here too" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expectEqual(1, session.viewer.windows.items.len);
+
+    // A second window, so there is something left to be attached to when
+    // the first one dies.
+    {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const doomed = session.viewer.windows.items[1].id;
+    {
+        const target = try std.fmt.allocPrint(alloc, "@{d}", .{doomed});
+        defer alloc.free(target);
+        const out = try session.ask(&.{ "kill-window", "-t", target });
+        alloc.free(out);
+    }
+
+    // tmux suppresses the dying window's %layout-change, so the close
+    // notification is the only word we get; without it the window would
+    // sit here forever as a native window nobody can type into.
+    //
+    // Killing a window in our own session sends the *unlinked* spelling,
+    // `%unlinked-window-close`, because the callback runs after the
+    // window has already left the session. This is the case that matters
+    // and the one this test covers. Plain `%window-close` arrives when a
+    // window is moved out rather than killed, and is handled the same.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 1 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    for (session.viewer.windows.items) |w| {
+        try testing.expect(w.id != doomed);
+    }
+    try testing.expect(!session.exited);
+}
