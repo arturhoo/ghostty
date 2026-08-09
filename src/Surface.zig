@@ -988,10 +988,15 @@ pub fn needsConfirmQuit(self: *Surface) bool {
         .always => true,
         .false => false,
         .true => true: {
-            // Closing a tmux pane kills the pane, which is the same
-            // thing closing a local terminal does to its process. There
-            // is no prompt state of ours to inspect either.
-            if (self.io.backend == .tmux) break :true false;
+            // A tmux pane is a process on whatever machine the session
+            // lives on, usually not this one, and killing it is not
+            // undone by opening another tab. Always ask.
+            //
+            // The prompt check below cannot stand in for this: our pane
+            // terminal is a shadow fed by replay, so "at a prompt" says
+            // what the pane looked like, not whether anything is running
+            // in it.
+            if (self.io.backend == .tmux) break :true true;
 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
@@ -2131,6 +2136,19 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
 /// The caller gets its own reference and must `unref` it. This is how the
 /// app runtime reaches the router without it having to travel through an
 /// action payload and the C ABI.
+/// Ask tmux to close windows, if this surface is a tmux pane.
+fn tmuxCloseTab(
+    self: *Surface,
+    scope: terminal.tmux.Viewer.Input.KillWindows.Scope,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.killWindows(pane.id, scope);
+    return true;
+}
+
 /// Ask tmux for a new window, if this surface is a tmux pane.
 ///
 /// Returns false for an ordinary surface, which is the caller's signal to
@@ -5431,15 +5449,27 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             );
         },
 
-        .close_tab => |v| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .close_tab,
-            switch (v) {
+        .close_tab => |v| {
+            // Closing the tab of a tmux pane kills the tmux window, so
+            // that the session on the other end agrees with what is on
+            // screen here. Closing only the native window would leave a
+            // window running that nothing shows.
+            if (self.tmuxCloseTab(switch (v) {
                 .this => .this,
-                .other => .other,
+                .other => .others,
                 .right => .right,
-            },
-        ),
+            })) return true;
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .close_tab,
+                switch (v) {
+                    .this => .this,
+                    .other => .other,
+                    .right => .right,
+                },
+            );
+        },
 
         inline .previous_tab,
         .next_tab,
