@@ -127,10 +127,32 @@ jobs:
       # Swift app. Upstream runs plain `xcodebuild -target Ghostty`
       # (ad-hoc signing works on hosted runners). If signing errors
       # appear, append: CODE_SIGNING_ALLOWED=NO
+      # -derivedDataPath so we know where the .app lands; without it
+      # xcodebuild hides it under a hashed DerivedData directory.
       - name: Build Ghostty.app
         run: |
           cd macos
-          xcodebuild -target Ghostty
+          xcodebuild -target Ghostty -derivedDataPath ./build
+
+      # ditto rather than zip: it preserves the symlinks and permissions
+      # inside an .app bundle, which a plain zip mangles.
+      - name: Package Ghostty.app
+        run: |
+          cd macos
+          APP=$(find ./build -name 'Ghostty.app' -maxdepth 4 -type d | head -1)
+          echo "packaging $APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" Ghostty.zip
+
+      # Downloadable from the run's summary page. The app is ad-hoc signed,
+      # so after unzipping clear the quarantine flag before opening it:
+      #   xattr -dr com.apple.quarantine Ghostty.app
+      - name: Upload Ghostty.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghostty-app-${{ github.sha }}
+          path: macos/Ghostty.zip
+          if-no-files-found: error
+          retention-days: 14
 
       # Optional: verify the iOS target also compiles (upstream does).
       # Uncomment if you touch iOS-relevant code.
