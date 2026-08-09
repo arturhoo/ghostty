@@ -375,6 +375,11 @@ extension Notification.Name {
     static let ghosttyDidUpdateScrollbar = Notification.Name("com.mitchellh.ghostty.didUpdateScrollbar")
     static let ScrollbarKey = ghosttyDidUpdateScrollbar.rawValue + ".scrollbar"
 
+    /// The tmux control mode window layout changed. The object is the
+    /// surface hosting the session.
+    static let ghosttyDidUpdateTmuxWindows = Notification.Name("com.mitchellh.ghostty.didUpdateTmuxWindows")
+    static let TmuxWindowsKey = ghosttyDidUpdateTmuxWindows.rawValue + ".tmuxWindows"
+
     /// Focus the search field
     static let ghosttySearchFocus = Notification.Name("com.mitchellh.ghostty.searchFocus")
 }
