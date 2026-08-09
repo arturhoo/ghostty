@@ -334,6 +334,85 @@ pub const Parser = struct {
                 .visible_layout = visible_layout,
                 .raw_flags = raw_flags,
             } };
+        } else if (std.mem.eql(u8, cmd, "%pause") or
+            std.mem.eql(u8, cmd, "%continue"))
+        cmd: {
+            var re = oni.Regex.init(
+                "^%(pause|continue) %([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const paused = line[@intCast(starts[1])] == 'p';
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[2])..@intCast(ends[2])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return if (paused)
+                .{ .pause = .{ .pane_id = id } }
+            else
+                .{ .@"continue" = .{ .pane_id = id } };
+        } else if (std.mem.eql(u8, cmd, "%extended-output")) cmd: {
+            var re = oni.Regex.init(
+                "^%extended-output %([0-9]+) ([0-9]+) : (.*)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const age = std.fmt.parseInt(
+                u64,
+                line[@intCast(starts[2])..@intCast(ends[2])],
+                10,
+            ) catch unreachable;
+            const data = data: {
+                const raw = line[@intCast(starts[3])..@intCast(ends[3])];
+                break :data unescape(raw, raw);
+            };
+
+            // Important: do not clear buffer here since data points to it
+            self.state = .idle;
+            return .{ .output = .{
+                .pane_id = id,
+                .data = data,
+                .age_ms = age,
+            } };
         } else if (std.mem.eql(u8, cmd, "%exit")) {
             // `%exit`, or `%exit <reason>`. tmux follows this with the
             // string terminator that ends the DCS, so the viewer would
@@ -659,10 +738,29 @@ pub const Notification = union(enum) {
     block_end: []const u8,
     block_err: []const u8,
 
+    /// tmux stopped sending a pane's output and is discarding it until
+    /// we ask for it to resume. Only happens with the pause-after client
+    /// flag, which we never set -- but any other client can set it on us
+    /// (`refresh-client -t <us> -f pause-after=N`), and a paused pane
+    /// looks exactly like a frozen one.
+    pause: struct {
+        pane_id: usize,
+    },
+
+    /// tmux resumed a paused pane, acknowledging our request.
+    @"continue": struct {
+        pane_id: usize,
+    },
+
     /// Raw output from a pane.
     output: struct {
         pane_id: usize,
         data: []const u8, // unescaped
+
+        /// How long tmux held this before sending it, in milliseconds.
+        /// Only present on `%extended-output`, which replaces `%output`
+        /// wholesale once pause-after is on for our client.
+        age_ms: ?u64 = null,
     },
 
     /// The client is now attached to the session with ID session-id, which is
@@ -1063,6 +1161,54 @@ test "tmux survives a name containing a newline" {
     for ("%window-add @7") |byte| try testing.expect(try c.put(byte) == null);
     const added = (try c.put('\n')).?;
     try testing.expectEqual(7, added.window_add.id);
+}
+
+test "tmux pause and continue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    for ("%pause %5") |byte| try testing.expect(try c.put(byte) == null);
+    const paused = (try c.put('\n')).?;
+    try testing.expect(paused == .pause);
+    try testing.expectEqual(5, paused.pause.pane_id);
+
+    for ("%continue %5") |byte| try testing.expect(try c.put(byte) == null);
+    const resumed = (try c.put('\n')).?;
+    try testing.expect(resumed == .@"continue");
+    try testing.expectEqual(5, resumed.@"continue".pane_id);
+}
+
+test "tmux extended-output is output with an age" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // Once pause-after is on for a client, this replaces %output
+    // wholesale. Same escaping, so it has to decode the same way.
+    for ("%extended-output %3 1234 : a\\015b") |byte| {
+        try testing.expect(try c.put(byte) == null);
+    }
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .output);
+    try testing.expectEqual(3, n.output.pane_id);
+    try testing.expectEqual(1234, n.output.age_ms.?);
+    try testing.expectEqualStrings("a\rb", n.output.data);
+}
+
+test "tmux output has no age" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%output %0 hi") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqual(null, n.output.age_ms);
 }
 
 test "tmux window-close" {

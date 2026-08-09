@@ -1046,6 +1046,21 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // tmux stopped sending us a pane's output. Ask for it back
+            // and re-read the pane, since what it discarded meanwhile is
+            // gone for good.
+            .pause => |info| self.pauseRecover(info.pane_id) catch {
+                log.warn("failed to resume a paused pane, becoming defunct", .{});
+                return self.defunct();
+            },
+
+            // tmux acknowledging the resume we asked for above. The
+            // capture commands queued alongside it do the rest.
+            .@"continue" => |info| log.info(
+                "tmux resumed pane id={}",
+                .{info.pane_id},
+            ),
+
             // A window left this session, by being killed, by its last
             // pane exiting, or by being moved elsewhere.
             .window_close => |info| self.windowClose(info.id) catch {
@@ -1158,6 +1173,39 @@ pub const Viewer = struct {
 
     /// When a window is added to the session, we need to refresh our window
     /// list to get the new window's information.
+    /// Bring a paused pane back.
+    ///
+    /// tmux pauses a pane when the pause-after client flag is set and we
+    /// fall behind on it. We never set that flag, but any other client
+    /// can set it on us, and while a pane is paused tmux *discards* its
+    /// output rather than buffering it (`control_write_output` in
+    /// control.c). So resuming is not enough: everything between the
+    /// pause and the resume is gone, and a shadow terminal that simply
+    /// carried on would be quietly wrong from then on.
+    ///
+    /// Re-read the pane instead, exactly as if it were new.
+    fn pauseRecover(self: *Viewer, pane_id: usize) !void {
+        if (!self.panes.contains(pane_id)) {
+            log.info("pause for untracked pane id={}, dropping", .{pane_id});
+            return;
+        }
+
+        const resume_cmd = try self.userCommand(
+            "refresh-client -A '%{d}:continue'\n",
+            .{pane_id},
+        );
+        errdefer resume_cmd.deinit(self.alloc);
+
+        try self.queueCommands(&.{
+            resume_cmd,
+            .{ .pane_history = .{ .id = pane_id, .screen_key = .primary } },
+            .{ .pane_visible = .{ .id = pane_id, .screen_key = .primary } },
+            .{ .pane_history = .{ .id = pane_id, .screen_key = .alternate } },
+            .{ .pane_visible = .{ .id = pane_id, .screen_key = .alternate } },
+            .pane_state,
+        });
+    }
+
     /// A window we were showing is gone.
     ///
     /// Refresh the whole list rather than pruning by hand: `syncLayouts`
@@ -3748,6 +3796,38 @@ test "tmux version comparison" {
         viewer.tmux_version = try viewer.alloc.dupe(u8, case[0]);
         try testing.expectEqual(case[1], viewer.tmuxVersionAtLeast(3, 4));
     }
+}
+
+test "a paused pane is resumed and re-read" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 0 } } },
+            .contains_command = "refresh-client -A '%0:continue'\n",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Resume, then four captures and a pane state: what
+                    // tmux discarded while paused is not coming back, so
+                    // the pane has to be read again from scratch.
+                    try testing.expectEqual(6, v.command_queue.len());
+                }
+            }).check,
+        },
+        // A pause for a pane we do not know is not worth a round trip.
+        .{
+            .input = .{ .tmux = .{ .pause = .{ .pane_id = 9 } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(6, v.command_queue.len());
+                }
+            }).check,
+        },
+    });
 }
 
 test "client size is reported to tmux once" {
