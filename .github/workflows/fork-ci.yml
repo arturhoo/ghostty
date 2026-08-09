@@ -59,7 +59,8 @@ jobs:
             libbz2-dev \
             libonig-dev \
             libxml2-utils \
-            pandoc
+            pandoc \
+            tmux
 
       - name: zig fmt
         run: zig fmt --check .
@@ -74,3 +75,12 @@ jobs:
       # It found one the first time it was run.
       - name: zig build (lib, compiles the embedded apprt)
         run: zig build -Dapp-runtime=none --summary all
+
+      # Spawns a real tmux server and drives control mode against it.
+      # Skipped by `zig build test` (they need tmux and they wait on
+      # another process), so they only run here. This step is a superset
+      # of the one above: same binary, plus the gated tests.
+      - name: zig build test-tmux-live
+        run: |
+          tmux -V
+          zig build test-tmux-live -Dapp-runtime=none --summary all
