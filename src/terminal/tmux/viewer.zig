@@ -299,6 +299,9 @@ pub const Viewer = struct {
         /// Move this pane's window along the session's window order.
         move_window: MoveWindow,
 
+        /// Rename the window this pane is in.
+        rename_window: RenameWindow,
+
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
@@ -354,6 +357,15 @@ pub const Viewer = struct {
 
         pub const ZoomPane = struct {
             pane_id: usize,
+        };
+
+        pub const RenameWindow = struct {
+            /// A pane in the window being renamed.
+            pane_id: usize,
+
+            /// The name the user typed. Empty means "go back to naming
+            /// itself"; see `nextRenameWindow`.
+            name: []const u8,
         };
 
         pub const MoveWindow = struct {
@@ -597,6 +609,7 @@ pub const Viewer = struct {
             .select_pane => self.nextSelectPane(input.select_pane),
             .zoom_pane => self.nextZoomPane(input.zoom_pane),
             .move_window => self.nextMoveWindow(input.move_window),
+            .rename_window => self.nextRenameWindow(input.rename_window),
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
@@ -945,6 +958,110 @@ pub const Viewer = struct {
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
         try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+    }
+
+    /// Write a window name as a single tmux command argument.
+    ///
+    /// This is the only place in the stack where user text becomes part
+    /// of a command, so it is worth setting out exactly what is being
+    /// defended against. A name has to survive two layers, and quoting
+    /// only helps with one of them.
+    ///
+    /// 1. **Control bytes are dropped**, the newline above all. tmux
+    ///    reads control mode input a line at a time
+    ///    (`evbuffer_readln(EVBUFFER_EOL_LF)` in control.c), so a raw
+    ///    newline in what we send *ends the command* and everything
+    ///    after it is read as another one. Quoting cannot save this:
+    ///    the line is split before the parser sees a quote. Nothing is
+    ///    lost by dropping them -- tmux itself runs a stored name
+    ///    through `utf8_stravis` and would not have shown them either.
+    ///
+    /// 2. **`#` is doubled.** `rename-window` puts its argument through
+    ///    format expansion *after* the parser has removed the quotes
+    ///    (`format_single_from_target` in cmd-rename-window.c), so
+    ///    `#(cmd)` starts a shell job and `#{var}` expands, single
+    ///    quotes or not. `##` is the format escape for a literal `#`.
+    ///
+    /// 3. **Single quotes around the result**, with an embedded quote
+    ///    written `'\''`. Inside single quotes tmux's lexer takes every
+    ///    byte literally, so `;`, `$`, backslash and the rest stop
+    ///    meaning anything.
+    ///
+    /// The caller is responsible for the `--` that keeps a name starting
+    /// with `-` from being read as a flag.
+    pub fn writeQuotedName(writer: *std.Io.Writer, name: []const u8) !void {
+        try writer.writeByte('\'');
+        for (name) |c| {
+            // C0 and DEL. See (1): these cannot be quoted around.
+            if (c < 0x20 or c == 0x7F) continue;
+
+            switch (c) {
+                // See (2). Doubled before quoting, because expansion
+                // happens after unquoting.
+                '#' => try writer.writeAll("##"),
+
+                // See (3). Close, escape, reopen.
+                '\'' => try writer.writeAll("'\\''"),
+
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeByte('\'');
+    }
+
+    /// Ask tmux to rename the window a pane is in.
+    ///
+    /// An empty name means "stop overriding", which in tmux is not an
+    /// empty name but `automatic-rename` back on: `rename-window` turns
+    /// that option *off* as a side effect, so renaming to "" would pin
+    /// the window to a blank name forever rather than returning it to
+    /// naming itself after what it is running.
+    fn nextRenameWindow(self: *Viewer, req: Input.RenameWindow) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        const window = self.windowForPane(req.pane_id) orelse {
+            log.info("rename for pane id={} in no window", .{req.pane_id});
+            return &.{};
+        };
+
+        if (req.name.len == 0) {
+            return self.queueUserCommand(
+                "set-option -w -t @{d} automatic-rename on\n",
+                .{window.id},
+            ) catch {
+                log.warn("failed to queue automatic-rename", .{});
+                return &.{};
+            };
+        }
+
+        return self.queueRename(window.id, req.name) catch {
+            log.warn("failed to queue rename-window", .{});
+            return &.{};
+        };
+    }
+
+    fn queueRename(
+        self: *Viewer,
+        window_id: usize,
+        name: []const u8,
+    ) Allocator.Error![]const Action {
+        var builder: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer builder.deinit();
+
+        // `--` so a name beginning with `-` is an argument and not a
+        // flag: tmux's argument parser would otherwise reject it.
+        builder.writer.print(
+            "rename-window -t @{d} -- ",
+            .{window_id},
+        ) catch return error.OutOfMemory;
+        writeQuotedName(&builder.writer, name) catch return error.OutOfMemory;
+        builder.writer.writeByte('\n') catch return error.OutOfMemory;
+
+        const command: Command = .{ .user = try builder.toOwnedSlice() };
+        errdefer command.deinit(self.alloc);
+
+        var one = [_]Command{command};
+        return self.queueUserCommands(&one);
     }
 
     /// Move a window along the session's window order.
@@ -4543,6 +4660,146 @@ fn testThreeWindowSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
     };
+}
+
+test "a window name cannot become a second command" {
+    const cases = [_]struct {
+        name: []const u8,
+        want: []const u8,
+        why: []const u8,
+    }{
+        .{
+            .name = "plain",
+            .want = "'plain'",
+            .why = "the ordinary case",
+        },
+
+        // The one that matters most. tmux reads control mode input a
+        // line at a time, so a newline ends the command and the rest is
+        // read as another -- quotes and all. Dropping it is the only
+        // defence; there is no escape for it.
+        .{
+            .name = "evil\nkill-window -t @1",
+            .want = "'evilkill-window -t @1'",
+            .why = "a newline would end the command and start a new one",
+        },
+        .{
+            .name = "tab\there\x00and null\x7f",
+            .want = "'tabhereand null'",
+            .why = "every control byte goes, not just the newline",
+        },
+
+        // Format expansion runs after the parser removes the quotes, so
+        // single quotes do not stop `#(...)` from starting a shell job.
+        .{
+            .name = "#(touch /tmp/pwn)",
+            .want = "'##(touch /tmp/pwn)'",
+            .why = "a format job would run even inside quotes",
+        },
+        .{
+            .name = "#{session_name}",
+            .want = "'##{session_name}'",
+            .why = "a format variable would expand",
+        },
+
+        // Inside single quotes tmux's lexer takes bytes literally, so
+        // these need nothing beyond the quoting itself.
+        .{
+            .name = "a; kill-server",
+            .want = "'a; kill-server'",
+            .why = "a command separator is literal inside quotes",
+        },
+        .{
+            .name = "$USER `whoami` \\ ~",
+            .want = "'$USER `whoami` \\ ~'",
+            .why = "expansion characters are literal inside quotes",
+        },
+        .{
+            .name = "};{",
+            .want = "'};{'",
+            .why = "braces are literal inside quotes",
+        },
+
+        // The quote itself: close, escape, reopen.
+        .{
+            .name = "it's a \"test\"",
+            .want = "'it'\\''s a \"test\"'",
+            .why = "an embedded quote must not end the quoting",
+        },
+
+        // Handled by the `--` the caller writes, but worth pinning that
+        // the name itself is not mangled.
+        .{
+            .name = "-x",
+            .want = "'-x'",
+            .why = "a leading dash is left alone; `--` is what saves it",
+        },
+    };
+
+    for (cases) |c| {
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer buf.deinit();
+        try Viewer.writeQuotedName(&buf.writer, c.name);
+        testing.expectEqualStrings(c.want, buf.written()) catch |err| {
+            std.debug.print("case failed: {s}\n", .{c.why});
+            return err;
+        };
+    }
+}
+
+test "renaming a window quotes the name and targets the window" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .rename_window = .{
+                .pane_id = 0,
+                .name = "a name",
+            } },
+            .contains_command = "rename-window -t @0 -- 'a name'\n",
+        },
+    });
+}
+
+test "clearing a window name gives it back to tmux" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Not `rename-window` with an empty argument: that would pin the
+        // window to a blank name, because renaming turns automatic-rename
+        // off as a side effect. Clearing the field means "name yourself
+        // again", which is that option going back on.
+        .{
+            .input = .{ .rename_window = .{ .pane_id = 0, .name = "" } },
+            .contains_command = "set-option -w -t @0 automatic-rename on\n",
+        },
+    });
+}
+
+test "renaming a pane we do not have is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .rename_window = .{ .pane_id = 9, .name = "x" } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
 }
 
 test "moving a tab swaps with its neighbour in tmux's order" {
