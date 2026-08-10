@@ -561,6 +561,44 @@ pub const Parser = struct {
             // Important: do not clear buffer here since name points to it
             self.state = .idle;
             return .{ .window_renamed = .{ .id = id, .name = name } };
+        } else if (std.mem.eql(u8, cmd, "%session-window-changed")) cmd: {
+            var re = oni.Regex.init(
+                "^%session-window-changed \\$([0-9]+) @([0-9]+)$",
+                .{ .capture_group = true },
+                oni.Encoding.utf8,
+                oni.Syntax.default,
+                null,
+            ) catch |err| {
+                log.warn("regex init failed error={}", .{err});
+                return error.RegexError;
+            };
+            defer re.deinit();
+
+            var region = re.search(line, .{}) catch |err| {
+                log.warn("failed to match notification cmd={s} line=\"{s}\" err={}", .{ cmd, line, err });
+                break :cmd;
+            };
+            defer region.deinit();
+            const starts = region.starts();
+            const ends = region.ends();
+
+            const session_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[1])..@intCast(ends[1])],
+                10,
+            ) catch unreachable;
+            const window_id = std.fmt.parseInt(
+                usize,
+                line[@intCast(starts[2])..@intCast(ends[2])],
+                10,
+            ) catch unreachable;
+
+            self.buffer.clearRetainingCapacity();
+            self.state = .idle;
+            return .{ .session_window_changed = .{
+                .session_id = session_id,
+                .window_id = window_id,
+            } };
         } else if (std.mem.eql(u8, cmd, "%window-pane-changed")) cmd: {
             var re = oni.Regex.init(
                 "^%window-pane-changed @([0-9]+) %([0-9]+)$",
@@ -849,6 +887,13 @@ pub const Notification = union(enum) {
 
     /// The active pane in the window with ID window-id changed to the pane
     /// with ID pane-id.
+    /// The session's current window changed. tmux sends this to every
+    /// control client, including the one whose `select-window` caused it.
+    session_window_changed: struct {
+        session_id: usize,
+        window_id: usize,
+    },
+
     window_pane_changed: struct {
         window_id: usize,
         pane_id: usize,
@@ -1297,6 +1342,20 @@ test "tmux unlinked-window-close is a window close" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_close);
     try testing.expectEqual(1, n.window_close.id);
+}
+
+test "tmux session-window-changed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    for ("%session-window-changed $2 @7") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .session_window_changed);
+    try testing.expectEqual(2, n.session_window_changed.session_id);
+    try testing.expectEqual(7, n.session_window_changed.window_id);
 }
 
 test "tmux session-renamed" {

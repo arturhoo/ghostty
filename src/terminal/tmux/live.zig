@@ -963,6 +963,60 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: tmux changing window tells us, and settles" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // We learned which window is current from `list-windows`, without
+    // being told: %session-window-changed only fires on a change.
+    try testing.expect(session.viewer.current_window_id != null);
+    const first = session.viewer.windows.items[0].id;
+    const second = session.viewer.windows.items[1].id;
+    try testing.expectEqual(first, session.viewer.current_window_id.?);
+
+    // Somebody else moves the session to the other window.
+    {
+        const target = try std.fmt.allocPrint(alloc, "@{d}", .{second});
+        defer alloc.free(target);
+        const out = try session.ask(&.{ "select-window", "-t", target });
+        alloc.free(out);
+    }
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.current_window_id != null and
+                v.viewer.current_window_id.? != v.viewer.windows.items[0].id and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    try testing.expectEqual(second, session.viewer.current_window_id.?);
+    for (session.viewer.windows.items) |w| {
+        try testing.expectEqual(w.id == second, w.active);
+    }
+
+    // And it settled: the notification did not send a command back, so
+    // there is nothing in flight and nothing more coming.
+    try testing.expect(session.viewer.command_queue.empty());
+    try testing.expect(!session.exited);
+}
+
 test "live: focusing a pane moves tmux's active pane" {
     if (!enabled()) return error.SkipZigTest;
 

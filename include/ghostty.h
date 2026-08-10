@@ -926,6 +926,9 @@ typedef struct {
 // Node index 0 is the root of the layout tree. `nodes` is never empty.
 typedef struct {
   size_t id;
+  // Whether tmux is currently on this window. At most one window in a
+  // set has this; a GUI showing the session should bring it forward.
+  bool active;
   // NUL terminated, never null, owned by the action. An unnamed window
   // is an empty string.
   const char* name;

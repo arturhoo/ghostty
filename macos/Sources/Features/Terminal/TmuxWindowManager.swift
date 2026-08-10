@@ -134,6 +134,36 @@ class TmuxWindowManager {
         }
 
         prune(liveWindows: liveWindows, livePanes: livePanes, host: host)
+        selectActiveWindow(action.windows, host: host)
+    }
+
+    /// Bring forward the tab for the window tmux is currently on.
+    ///
+    /// tmux tracks a current window per session, and it moves when
+    /// anyone moves it -- another client, a script, a binding typed in a
+    /// pane. When it moves for a reason that did not come from us, the
+    /// tab on screen and the window tmux thinks the user is on have come
+    /// apart, and tmux's answer is the right one.
+    ///
+    /// Only when the group is already frontmost. tmux says nothing about
+    /// whether ghostty should come forward, and a background session
+    /// changing windows is not a reason to interrupt whatever the user
+    /// is doing in another app -- or another window of this one.
+    ///
+    /// Selecting a tab that is already selected is not free: AppKit
+    /// still runs the tab switch, so the check matters.
+    private func selectActiveWindow(
+        _ windows: [Ghostty.Action.TmuxWindows.Window],
+        host: ObjectIdentifier
+    ) {
+        guard let active = windows.first(where: { $0.active }) else { return }
+        guard let controller = self.windows[Key(host: host, id: active.id)]?.value,
+              let window = controller.window else { return }
+        guard let group = window.tabGroup else { return }
+        guard group.selectedWindow !== window else { return }
+        guard group.windows.contains(where: { $0.isKeyWindow }) else { return }
+
+        group.selectedWindow = window
     }
 
     /// Put focus back on a surviving pane when the focused one is gone.

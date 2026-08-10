@@ -194,6 +194,13 @@ pub const Viewer = struct {
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
 
+    /// The window tmux says is current, as of the last notification.
+    /// Null until tmux tells us, which it only does on a change.
+    current_window_id: ?usize = null,
+
+    /// The pane tmux says is active, as of the last notification.
+    tmux_active_pane: ?usize = null,
+
     /// The pane we last told tmux the user was in. See `nextSelectPane`
     /// for why a repeat is dropped rather than sent.
     last_selected_pane: ?usize = null,
@@ -356,6 +363,12 @@ pub const Viewer = struct {
         /// round trip to `list-windows`.
         name: []const u8,
 
+        /// Whether tmux is currently on this window. Kept on the window
+        /// rather than as one id on the viewer because that is the shape
+        /// the GUI reads it in, and it cannot then disagree with the set
+        /// it arrived with.
+        active: bool = false,
+
         width: usize,
         height: usize,
         layout_arena: ArenaAllocator.State,
@@ -485,6 +498,8 @@ pub const Viewer = struct {
             .command_queue = command_queue,
             .windows = .empty,
             .panes = .empty,
+            .current_window_id = null,
+            .tmux_active_pane = null,
             .last_selected_pane = null,
             .action_arena = .{},
             .action_single = undefined,
@@ -794,6 +809,44 @@ pub const Viewer = struct {
         };
     }
 
+    /// tmux moved to another window.
+    ///
+    /// Recorded *and* passed on, which is the whole of the inbound
+    /// direction. The recording is what stops the loop: `nextSelectPane`
+    /// only emits `select-window` when the window it wants differs from
+    /// this, so the notification answering our own command cannot
+    /// produce another one.
+    ///
+    /// That is the lesson from iTerm2, whose `TmuxController` documents
+    /// the exact livelock this avoids: not echoing a command back in
+    /// response to a notification is what makes the system settle.
+    fn sessionWindowChanged(
+        self: *Viewer,
+        actions: *std.ArrayList(Action),
+        window_id: usize,
+    ) !void {
+        self.current_window_id = window_id;
+
+        // A window we have never heard of is not one the GUI can focus.
+        // The layout that introduces it will arrive on its own, carrying
+        // this same current-window flag with it.
+        for (self.windows.items) |w| {
+            if (w.id == window_id) break;
+        } else {
+            log.info("current window id={} unknown, not focusing", .{window_id});
+            return;
+        }
+
+        for (self.windows.items) |*w| w.active = w.id == window_id;
+
+        // Re-send the window list rather than inventing an action for
+        // one field. The GUI already diffs this on every change, and
+        // which window is current is a fact about the set.
+        var arena = self.action_arena.promote(self.alloc);
+        defer self.action_arena = arena.state;
+        try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+    }
+
     /// Tell tmux which pane the user is in.
     ///
     /// `select-pane` moves the active pane within its window, which is
@@ -818,13 +871,65 @@ pub const Viewer = struct {
         }
         self.last_selected_pane = req.pane_id;
 
-        return self.queueUserCommand(
-            "select-pane -t %{d}\n",
-            .{req.pane_id},
-        ) catch {
+        return self.queueSelect(req.pane_id) catch {
             log.warn("failed to queue select-pane", .{});
             return &.{};
         };
+    }
+
+    /// `select-pane`, preceded by `select-window` when the pane the user
+    /// moved into is not in the window tmux is currently on.
+    ///
+    /// `select-pane` only moves the active pane *within its own window*
+    /// (tmux `cmd-select-pane.c`), so without this, focusing a pane in
+    /// another window would leave tmux on the window it was already on
+    /// and quietly disagree with the screen.
+    ///
+    /// The window command is skipped when tmux is already there. That is
+    /// the outbound half of the loop suppression: if we sent it anyway,
+    /// tmux would answer with `%session-window-changed`, which we would
+    /// pass to the GUI as "go to this window" -- for a window it is
+    /// already showing, every time focus moved.
+    fn queueSelect(
+        self: *Viewer,
+        pane_id: usize,
+    ) Allocator.Error![]const Action {
+        const window = self.windowForPane(pane_id);
+        const need_window = if (window) |w| need: {
+            const current = self.current_window_id orelse break :need true;
+            break :need current != w.id;
+        } else false;
+
+        if (!need_window) return self.queueUserCommand(
+            "select-pane -t %{d}\n",
+            .{pane_id},
+        );
+
+        var commands: [2]Command = undefined;
+        var count: usize = 0;
+        errdefer for (commands[0..count]) |c| c.deinit(self.alloc);
+
+        // The window first: selecting a pane in a window tmux is not on
+        // is the same clamping problem as sizing a pane inside a window
+        // that is too small.
+        commands[count] = try self.userCommand(
+            "select-window -t @{d}\n",
+            .{window.?.id},
+        );
+        count += 1;
+
+        commands[count] = try self.userCommand(
+            "select-pane -t %{d}\n",
+            .{pane_id},
+        );
+        count += 1;
+
+        // Taking it on trust that tmux honours this, so a notification
+        // that merely confirms it does not come back as a fresh
+        // instruction to the GUI.
+        self.current_window_id = window.?.id;
+
+        return self.queueUserCommands(commands[0..count]);
     }
 
     /// Leave the session.
@@ -1297,9 +1402,26 @@ pub const Viewer = struct {
             // so there is nothing to do but not treat it as unknown.
             .session_renamed => {},
 
-            // The active pane changed. We don't care about this because
-            // we handle our own focus.
-            .window_pane_changed => {},
+            // tmux moved its active pane. Recorded rather than acted
+            // on: it is the answer to our own `select-pane` as often as
+            // it is news, and echoing a command back at a notification
+            // is how this turns into a loop. Where the *user* should be
+            // looking is a window-level question, answered below.
+            .window_pane_changed => |info| {
+                self.tmux_active_pane = info.pane_id;
+                self.last_selected_pane = info.pane_id;
+            },
+
+            // tmux moved to another window, which is the one thing here
+            // the GUI has to follow: the user asked for it in another
+            // client, or a script did, and the window they mean is not
+            // the one on screen.
+            .session_window_changed => |info| self.sessionWindowChanged(
+                &actions,
+                info.window_id,
+            ) catch {
+                log.warn("failed to handle window change", .{});
+            },
 
             // We ignore this one. It means a session was created or
             // destroyed. If it was our own session we will get an exit
@@ -1757,12 +1879,19 @@ pub const Viewer = struct {
                 return err;
             };
 
+            // Which window tmux is on, learned here rather than waited
+            // for: `%session-window-changed` only fires on a change, so
+            // without this the first focus would send a `select-window`
+            // for a window tmux is very likely already on.
+            if (data.window_active) self.current_window_id = data.window_id;
+
             const name = try self.alloc.dupe(u8, data.window_name);
             errdefer self.alloc.free(name);
 
             try windows.append(self.alloc, .{
                 .id = data.window_id,
                 .name = name,
+                .active = data.window_active,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
@@ -2309,6 +2438,7 @@ const Format = struct {
         .vars = &.{
             .session_id,
             .window_id,
+            .window_active,
             .window_width,
             .window_height,
             .window_layout,
@@ -2452,7 +2582,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$1 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2499,7 +2629,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$2 @1 0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2551,7 +2681,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2718,7 +2848,7 @@ test "capture replay decodes escaped escape sequences" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 80 24 b25d,80x24,0,0,0
+                \\$0 @0 1 80 24 b25d,80x24,0,0,0
                 ,
             } },
             .check_command = (struct {
@@ -2791,7 +2921,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2862,7 +2992,7 @@ test "layout_change does not return command when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2923,7 +3053,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2990,7 +3120,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3051,7 +3181,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3113,7 +3243,7 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
+                \\$0 @0 1 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3287,7 +3417,7 @@ test "write sends keys to the target pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3344,7 +3474,7 @@ test "write waits for the in-flight command" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3403,7 +3533,7 @@ test "write to an unknown pane is dropped" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3609,7 +3739,7 @@ fn testSinglePaneSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 83 44 b7dd,83x44,0,0,0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0
             ,
         } } },
         // Four capture-pane replies plus pane_state.
@@ -3636,7 +3766,7 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
             .name = "test",
         } } } },
         .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "$0 @0 83 44 " ++ layout } } },
+        .{ .input = .{ .tmux = .{ .block_end = "$0 @0 1 83 44 " ++ layout } } },
         // Four capture-pane replies per pane.
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -3997,6 +4127,105 @@ test "focusing a pane tells tmux, once" {
     });
 }
 
+test "focus sync converges instead of looping" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Outbound: the user moves into a pane, we tell tmux.
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .contains_command = "select-pane -t %1\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // tmux answers our own command with a notification. Echoing a
+        // command back at this is the livelock iTerm2's TmuxController
+        // documents, so it has to produce nothing at all.
+        .{
+            .input = .{ .tmux = .{ .window_pane_changed = .{
+                .window_id = 0,
+                .pane_id = 1,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+
+        // And the pane it names is now the one we would dedupe against,
+        // so the user focusing it again is silent too.
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+
+        // Inbound: tmux moved to a window on someone else's say-so. The
+        // GUI is told, and still nothing is sent back.
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{
+                .session_id = 0,
+                .window_id = 0,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    for (actions) |action| {
+                        try testing.expect(action != .command);
+                        if (action == .windows) found = true;
+                    }
+
+                    // The GUI is told, through the window set it already
+                    // reads, which window to bring forward.
+                    try testing.expect(found);
+                    try testing.expect(v.windows.items[0].active);
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(0, v.current_window_id.?);
+                }
+            }).check,
+        },
+    });
+}
+
+test "a window we do not know is not focused" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // The layout that introduces it has not arrived yet. Telling the
+        // GUI to focus a window it does not have is worse than waiting.
+        .{
+            .input = .{ .tmux = .{ .session_window_changed = .{
+                .session_id = 0,
+                .window_id = 7,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| {
+                        try testing.expect(action != .windows);
+                    }
+                    // Recorded even so: it is still where tmux is, and
+                    // that is what stops us telling it to go there.
+                    try testing.expectEqual(7, v.current_window_id.?);
+                }
+            }).check,
+        },
+    });
+}
+
 test "a pane we do not have is not selected" {
     var viewer = try Viewer.init(testing.io, testing.allocator);
     defer viewer.deinit();
@@ -4124,7 +4353,7 @@ test "an old tmux sizes windows the old way" {
         .{ .input = .{ .tmux = .{ .block_end = "3.3a" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 83 44 b7dd,83x44,0,0,0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0
             ,
         } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -4548,7 +4777,7 @@ test "layout change resizes a surviving pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
                 ,
             } },
             .check = (struct {
@@ -4603,7 +4832,7 @@ test "list-windows windows action outlives the parse" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{.windows},
