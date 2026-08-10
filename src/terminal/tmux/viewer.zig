@@ -194,6 +194,10 @@ pub const Viewer = struct {
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
 
+    /// Seconds of backlog tmux may hold for us before pausing a pane, or
+    /// 0 for tmux's own behaviour. See `Options.pause_after`.
+    pause_after: u32 = 0,
+
     /// The window tmux says is current, as of the last notification.
     /// Null until tmux tells us, which it only does on a change.
     current_window_id: ?usize = null,
@@ -481,7 +485,27 @@ pub const Viewer = struct {
     ///
     /// The given allocator is used for all internal state. You must
     /// call deinit when you're done with the viewer to free it.
-    pub fn init(io: std.Io, alloc: Allocator) Allocator.Error!Viewer {
+    pub const Options = struct {
+        /// Seconds of pane output tmux may buffer for us before it pauses
+        /// the pane and tells us, or 0 to leave the flag unset.
+        ///
+        /// Unset is tmux's default and it is not a safe one: a control
+        /// client that falls behind is not throttled, and once the
+        /// backlog passes `CONTROL_MAXIMUM_AGE` (five minutes) tmux kills
+        /// the client, taking every window of the session with it.
+        ///
+        /// The reason this is not simply always on is that a paused pane
+        /// has its output *discarded* rather than buffered, so resuming
+        /// means re-reading the pane and losing whatever scrolled past.
+        /// Which of the two is worse belongs to the user.
+        pause_after: u32 = 0,
+    };
+
+    pub fn init(
+        io: std.Io,
+        alloc: Allocator,
+        opts: Options,
+    ) Allocator.Error!Viewer {
         // Create our initial command queue
         var command_queue: CommandQueue = try .init(alloc, COMMAND_QUEUE_INITIAL);
         errdefer command_queue.deinit(alloc);
@@ -498,6 +522,7 @@ pub const Viewer = struct {
             .command_queue = command_queue,
             .windows = .empty,
             .panes = .empty,
+            .pause_after = opts.pause_after,
             .current_window_id = null,
             .tmux_active_pane = null,
             .last_selected_pane = null,
@@ -1715,7 +1740,11 @@ pub const Viewer = struct {
         session_id: usize,
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         // Build up a new viewer. Its the easiest way to reset ourselves.
-        var replacement: Viewer = try .init(self.io, self.alloc);
+        // Options carry over: they came from the user's config, not from
+        // the session that just ended.
+        var replacement: Viewer = try .init(self.io, self.alloc, .{
+            .pause_after = self.pause_after,
+        });
         errdefer replacement.deinit();
 
         // Our actions must start out empty so we don't mix arenas
@@ -1788,6 +1817,10 @@ pub const Viewer = struct {
         switch (command) {
             .user => {},
 
+            // Nothing to read: the flag is set or it is not, and tmux
+            // says so by erroring the block, which is handled above.
+            .pause_after => {},
+
             .pane_state => try self.receivedPaneState(content),
 
             .list_windows => try self.receivedListWindows(
@@ -1832,6 +1865,13 @@ pub const Viewer = struct {
             self.alloc.free(self.tmux_version);
         }
         self.tmux_version = try self.alloc.dupe(u8, data.version);
+
+        // Now that the version is known, and only now, because the flag
+        // does not exist before 3.2 and an older server answers with an
+        // error rather than ignoring it.
+        if (self.pause_after > 0 and self.tmuxVersionAtLeast(3, 2)) {
+            try self.queueCommands(&.{.{ .pause_after = self.pause_after }});
+        }
     }
 
     fn receivedListWindows(
@@ -2296,6 +2336,10 @@ const Command = union(enum) {
     /// Get the tmux server version.
     tmux_version,
 
+    /// Ask tmux to pause a pane rather than let its backlog grow without
+    /// bound. The payload is the age in seconds.
+    pause_after: u32,
+
     /// User command. This is a command provided by the user. Since
     /// this is user provided, we can't be sure what it is.
     user: []const u8,
@@ -2312,6 +2356,7 @@ const Command = union(enum) {
             .pane_visible,
             .pane_state,
             .tmux_version,
+            .pause_after,
             => {},
             .user => |v| alloc.free(v),
         };
@@ -2325,6 +2370,15 @@ const Command = union(enum) {
         writer: *std.Io.Writer,
     ) std.Io.Writer.Error!void {
         switch (self) {
+            // `-f` sets client flags; `pause-after=N` is the one that
+            // makes tmux pause a pane rather than kill us for falling
+            // behind (tmux server-client.c). Landed in 3.2, so the caller
+            // gates on the version before queueing this.
+            .pause_after => |seconds| try writer.print(
+                "refresh-client -f pause-after={d}\n",
+                .{seconds},
+            ),
+
             .list_windows => try writer.writeAll(std.fmt.comptimePrint(
                 "list-windows -F '{s}'\n",
                 .{comptime Format.list_windows.comptimeFormat()},
@@ -2540,7 +2594,7 @@ fn testViewer(viewer: *Viewer, steps: []const TestStep) !void {
 }
 
 test "immediate exit" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2560,7 +2614,7 @@ test "immediate exit" {
 }
 
 test "session changed resets state" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2651,7 +2705,7 @@ test "session changed resets state" {
 }
 
 test "initial flow" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2832,7 +2886,7 @@ test "initial flow" {
 }
 
 test "capture replay decodes escaped escape sequences" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2899,7 +2953,7 @@ test "capture replay decodes escaped escape sequences" {
 }
 
 test "layout change" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -2970,7 +3024,7 @@ test "layout change" {
 }
 
 test "layout_change does not return command when queue not empty" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3031,7 +3085,7 @@ test "layout_change does not return command when queue not empty" {
 }
 
 test "layout_change returns command when queue was empty" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3098,7 +3152,7 @@ test "layout_change returns command when queue was empty" {
 }
 
 test "window_add queues list_windows when queue empty" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3159,7 +3213,7 @@ test "window_add queues list_windows when queue empty" {
 }
 
 test "window_add queues list_windows when queue not empty" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3215,7 +3269,7 @@ test "window_add queues list_windows when queue not empty" {
 }
 
 test "two pane flow with pane state" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3396,7 +3450,7 @@ test "two pane flow with pane state" {
 }
 
 test "write sends keys to the target pane" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3452,7 +3506,7 @@ test "write sends keys to the target pane" {
 }
 
 test "write waits for the in-flight command" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3512,7 +3566,7 @@ test "write waits for the in-flight command" {
 }
 
 test "write to an unknown pane is dropped" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3570,7 +3624,7 @@ test "write to an unknown pane is dropped" {
 }
 
 test "write before startup completes is dropped" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -3780,7 +3834,7 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
 }
 
 test "pane state maps tmux mouse flags to the right modes" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -3810,7 +3864,7 @@ test "pane state maps tmux mouse flags to the right modes" {
 }
 
 test "attached sink mirrors the pane terminal" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     var mirror: MirrorSink = undefined;
@@ -3871,7 +3925,7 @@ test "attached sink mirrors the pane terminal" {
 }
 
 test "sink is closed when its pane goes away" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     var mirror: MirrorSink = undefined;
@@ -3895,7 +3949,7 @@ test "sink is closed when its pane goes away" {
 }
 
 test "resizing a lone pane resizes its window" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -3966,7 +4020,7 @@ test "resizing a lone pane resizes its window" {
 }
 
 test "resizing a split pane sizes both the window and the pane" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
@@ -4010,7 +4064,7 @@ test "resizing a split pane sizes both the window and the pane" {
 }
 
 test "a side-by-side split composes across the other axis" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_horizontal));
@@ -4028,7 +4082,7 @@ test "a side-by-side split composes across the other axis" {
 }
 
 test "a window is only resized when its own size changes" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
@@ -4065,7 +4119,7 @@ test "a window is only resized when its own size changes" {
 }
 
 test "tmux resizing a pane forgets what we asked for" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
@@ -4094,7 +4148,7 @@ test "tmux resizing a pane forgets what we asked for" {
 }
 
 test "focusing a pane tells tmux, once" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
@@ -4128,7 +4182,7 @@ test "focusing a pane tells tmux, once" {
 }
 
 test "focus sync converges instead of looping" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
@@ -4198,7 +4252,7 @@ test "focus sync converges instead of looping" {
 }
 
 test "a window we do not know is not focused" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4227,7 +4281,7 @@ test "a window we do not know is not focused" {
 }
 
 test "a pane we do not have is not selected" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4247,7 +4301,7 @@ test "a pane we do not have is not selected" {
 }
 
 test "a layout change forgets which pane we selected" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4279,8 +4333,96 @@ test "a layout change forgets which pane we selected" {
     });
 }
 
+test "pause mode is asked for once the version allows it" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .pause_after = 30,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+
+        // The version reply is what unblocks this: the flag does not
+        // exist before 3.2 and we cannot know which we are talking to
+        // until tmux says.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    var found = false;
+                    var it = v.command_queue.iterator(.forward);
+                    while (it.next()) |c| {
+                        if (c.* == .pause_after) {
+                            try testing.expectEqual(30, c.pause_after);
+                            found = true;
+                        }
+                    }
+                    try testing.expect(found);
+                }
+            }).check,
+        },
+    });
+}
+
+test "an old tmux is not asked for pause mode" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{
+        .pause_after = 30,
+    });
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+
+        // 3.1 has no pause-after flag. Asking would earn an error block
+        // and nothing else.
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.1c" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    var it = v.command_queue.iterator(.forward);
+                    while (it.next()) |c| {
+                        try testing.expect(c.* != .pause_after);
+                    }
+                }
+            }).check,
+        },
+    });
+}
+
+test "pause mode is not asked for when it is off" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    var it = v.command_queue.iterator(.forward);
+                    while (it.next()) |c| {
+                        try testing.expect(c.* != .pause_after);
+                    }
+                }
+            }).check,
+        },
+    });
+}
+
 test "detaching asks tmux to detach this client" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4295,7 +4437,7 @@ test "detaching asks tmux to detach this client" {
 }
 
 test "a size tmux will not give us is not asked for twice" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4340,7 +4482,7 @@ test "a size tmux will not give us is not asked for twice" {
 }
 
 test "an old tmux sizes windows the old way" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4379,7 +4521,7 @@ test "an old tmux sizes windows the old way" {
 }
 
 test "tmux version comparison" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     const cases = .{
@@ -4403,7 +4545,7 @@ test "tmux version comparison" {
 }
 
 test "a paused pane is resumed and re-read" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4435,7 +4577,7 @@ test "a paused pane is resumed and re-read" {
 }
 
 test "a layout change keeps the window name" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4475,7 +4617,7 @@ test "a layout change keeps the window name" {
 const long_window_name = "a" ** 512;
 
 test "a window rename does not cost a round trip" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4520,7 +4662,7 @@ test "a window rename does not cost a round trip" {
 }
 
 test "client size is reported to tmux once" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4548,7 +4690,7 @@ test "client size is reported to tmux once" {
 }
 
 test "kill pane asks tmux to kill it" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4572,7 +4714,7 @@ test "kill pane asks tmux to kill it" {
 }
 
 test "new inputs are dropped before startup completes" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4591,7 +4733,7 @@ test "new inputs are dropped before startup completes" {
 }
 
 test "attach sizes the sink from the pane" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     // Deliberately the wrong size: attaching has to correct it.
@@ -4607,7 +4749,7 @@ test "attach sizes the sink from the pane" {
 }
 
 test "attach is refused while the pane is mid-sequence" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     var mirror: MirrorSink = undefined;
@@ -4639,7 +4781,7 @@ test "attach is refused while the pane is mid-sequence" {
 }
 
 test "sinks are closed when the connection ends" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     var mirror: MirrorSink = undefined;
@@ -4661,7 +4803,7 @@ test "sinks are closed when the connection ends" {
 }
 
 test "detaching a pane closes its sink" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     var mirror: MirrorSink = undefined;
@@ -4684,7 +4826,7 @@ test "detaching a pane closes its sink" {
 }
 
 test "output escape sequence split across notifications" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4728,7 +4870,7 @@ test "output escape sequence split across notifications" {
 }
 
 test "pane state restores the active screen" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, testSinglePaneSteps());
@@ -4763,7 +4905,7 @@ test "layout dimensions clamp to the cell count limit" {
 }
 
 test "layout change resizes a surviving pane" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
@@ -4819,7 +4961,7 @@ test "layout change resizes a surviving pane" {
 }
 
 test "list-windows windows action outlives the parse" {
-    var viewer = try Viewer.init(testing.io, testing.allocator);
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
     defer viewer.deinit();
 
     try testViewer(&viewer, &.{
