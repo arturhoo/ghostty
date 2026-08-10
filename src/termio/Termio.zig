@@ -645,8 +645,26 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
+    if (comptime StreamHandler.tmux_enabled) {
+        const router = router: {
+            // We are modifying terminal state from here on out and we
+            // need the lock to grab our read data.
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.processOutputLocked(buf);
+            break :router self.terminal_stream.handler.tmux_router;
+        };
+
+        // Our renderer mutex is released here: the defer above ran when
+        // the block exited. Parsing may have handed the router a pile of
+        // pane operations, and delivering them takes each pane's own
+        // renderer mutex, so it has to happen from here rather than from
+        // inside the block. Holding two renderer mutexes at once is the
+        // one thing this whole arrangement exists to avoid.
+        if (router) |r| r.flush();
+        return;
+    }
+
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf);
