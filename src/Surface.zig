@@ -2162,6 +2162,16 @@ fn tmuxNewWindow(self: *Surface) bool {
     return true;
 }
 
+/// Ask tmux to rename this pane's window, if this surface is a pane.
+fn tmuxRenameWindow(self: *Surface, name: []const u8) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.renameWindow(pane.id, name);
+    return true;
+}
+
 /// Ask tmux to move this pane's window, if this surface is a pane.
 fn tmuxMoveWindow(self: *Surface, amount: isize) bool {
     if (comptime !terminal.options.tmux_control_mode) return false;
@@ -5357,6 +5367,13 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .set_tab_title => |v| {
+            // A tmux window's name belongs to tmux. Setting a local
+            // override instead would be overwritten by the very next
+            // layout, which is what used to happen: the rename appeared
+            // to work and then silently reverted. The name comes back
+            // through %window-renamed and lands as the title from there.
+            if (self.tmuxRenameWindow(v)) return true;
+
             const title = try self.alloc.dupeZ(u8, v);
             defer self.alloc.free(title);
             return try self.rt_app.performAction(

@@ -1042,6 +1042,122 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: a hostile window name does not become a command" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // A second window, whose only job is to still be here at the end.
+    {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const victim = session.viewer.windows.items[1].id;
+    const pane = session.viewer.windows.items[0].layout.content.pane;
+
+    // Everything that has to be neutralised, in one name: a newline that
+    // would end the command and start another, a format job that would
+    // run a shell, a command separator, and a quote that would end the
+    // quoting. Fed unescaped this kills the other window.
+    var buf: [128]u8 = undefined;
+    const hostile = try std.fmt.bufPrint(
+        &buf,
+        "x\nkill-window -t @{d}\n#(touch /tmp/ghostty-pwned) ; it's",
+        .{victim},
+    );
+
+    try session.input(.{ .rename_window = .{
+        .pane_id = pane,
+        .name = hostile,
+    } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // The window it tried to kill is still here.
+    {
+        const count = try session.ask(&.{
+            "display-message", "-p", "#{session_windows}",
+        });
+        defer alloc.free(count);
+        try testing.expectEqualStrings("2", std.mem.trim(u8, count, " \r\n"));
+    }
+
+    // And the name is the literal text, with the control bytes gone and
+    // the format job stored rather than run. tmux escapes what it stores,
+    // so the `#` comes back as `#` and not as the output of anything.
+    {
+        const name = try session.ask(&.{
+            "display-message", "-p", "-t", "@0", "#{window_name}",
+        });
+        defer alloc.free(name);
+        const got = std.mem.trim(u8, name, " \r\n");
+        try testing.expect(std.mem.indexOf(u8, got, "#(touch") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "it's") != null);
+        try testing.expect(std.mem.indexOfScalar(u8, got, '\n') == null);
+    }
+
+    try testing.expect(!session.exited);
+}
+
+test "live: clearing a name gives the window back to tmux" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    const pane = session.viewer.windows.items[0].layout.content.pane;
+
+    try session.input(.{ .rename_window = .{ .pane_id = pane, .name = "fixed" } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // Renaming turns automatic-rename off. That is tmux's doing, and it
+    // is why clearing the name cannot just be an empty rename.
+    {
+        const opt = try session.ask(&.{
+            "show-options", "-w", "-t", "@0", "-v", "automatic-rename",
+        });
+        defer alloc.free(opt);
+        try testing.expectEqualStrings("off", std.mem.trim(u8, opt, " \r\n"));
+    }
+
+    try session.input(.{ .rename_window = .{ .pane_id = pane, .name = "" } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    {
+        const opt = try session.ask(&.{
+            "show-options", "-w", "-t", "@0", "-v", "automatic-rename",
+        });
+        defer alloc.free(opt);
+        try testing.expectEqualStrings("on", std.mem.trim(u8, opt, " \r\n"));
+    }
+
+    try testing.expect(!session.exited);
+}
+
 test "live: moving a tab reorders tmux's windows" {
     if (!enabled()) return error.SkipZigTest;
 
