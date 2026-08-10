@@ -963,6 +963,36 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: detaching ends control mode and leaves the session running" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try testing.expect(!session.exited);
+
+    try session.input(.detach);
+
+    // tmux ends control mode, which is how the GUI learns to close the
+    // windows this client was showing.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.exited;
+        }
+    }.pred);
+
+    // The half that makes this detach and not kill: the server is still
+    // up and the session is still in it, with its window still running.
+    // Without this the test passes just as well for `kill-session`.
+    const sessions = try session.ask(&.{
+        "list-sessions", "-F", "#{session_windows}",
+    });
+    defer alloc.free(sessions);
+    try testing.expectEqualStrings("1", std.mem.trim(u8, sessions, " \r\n"));
+}
+
 test "live: a split makes a second pane in the same window" {
     if (!enabled()) return error.SkipZigTest;
 

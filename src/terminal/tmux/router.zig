@@ -102,6 +102,10 @@ pub const Router = struct {
                 pane_id: usize,
                 scope: KillScope,
             ) void,
+
+            /// The user asked to leave the session, without killing
+            /// anything in it.
+            detach: *const fn (ctx: *anyopaque) void,
         };
     };
 
@@ -413,6 +417,17 @@ pub const Router = struct {
         self.host.vtable.newWindow(self.host.ctx);
     }
 
+    /// Leave the session, leaving everything in it running.
+    ///
+    /// Not tied to a pane, and deliberately the whole session: detaching
+    /// is a statement about this client, not about whichever pane the
+    /// user was looking at when they asked.
+    pub fn detach(self: *Router) void {
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.detach(self.host.ctx);
+    }
+
     /// Ask tmux to split a pane. `horizontal` is tmux's sense of the
     /// word: a new pane to the right, side by side.
     pub fn splitPane(
@@ -505,6 +520,7 @@ const TestHost = struct {
     }) = .empty,
     kills: std.ArrayList(usize) = .empty,
     new_windows: usize = 0,
+    detaches: usize = 0,
     splits: std.ArrayList(struct {
         pane_id: usize,
         horizontal: bool,
@@ -521,6 +537,7 @@ const TestHost = struct {
         .newWindow = newWindow,
         .split = split,
         .killWindows = killWindows,
+        .detach = detach,
     };
 
     fn killWindows(
@@ -538,6 +555,11 @@ const TestHost = struct {
     fn newWindow(ctx: *anyopaque) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         self.new_windows += 1;
+    }
+
+    fn detach(ctx: *anyopaque) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.detaches += 1;
     }
 
     fn split(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
