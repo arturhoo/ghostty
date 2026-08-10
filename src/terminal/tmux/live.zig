@@ -113,6 +113,17 @@ const Session = struct {
         rows: u16,
         command: []const u8,
     ) !Session {
+        return startWith(alloc, io, cols, rows, command, .{});
+    }
+
+    fn startWith(
+        alloc: Allocator,
+        io: std.Io,
+        cols: u16,
+        rows: u16,
+        command: []const u8,
+        opts: Viewer.Options,
+    ) !Session {
         const socket = socket: {
             const dir = try osfile.allocTmpDir(alloc, global.environ());
             defer osfile.freeTmpDir(alloc, dir);
@@ -175,7 +186,7 @@ const Session = struct {
             reap(pid);
         }
 
-        var viewer = try Viewer.init(io, alloc);
+        var viewer = try Viewer.init(io, alloc, opts);
         errdefer viewer.deinit();
 
         return .{
@@ -1127,6 +1138,43 @@ test "live: focusing a pane moves tmux's active pane" {
     defer alloc.free(active);
     try testing.expectEqualStrings("%0", std.mem.trim(u8, active, " \r\n"));
     try testing.expect(!session.exited);
+}
+
+test "live: tmux accepts the pause-after flag we send it" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.startWith(
+        alloc,
+        testing.io,
+        80,
+        24,
+        "sleep 60",
+        .{ .pause_after = 30 },
+    );
+    defer session.deinit();
+
+    try session.waitFor(attached);
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // The point of the test. `refresh-client -f` answers an unknown flag
+    // with an error block, and an error block is not something the
+    // startup sequence survives quietly -- so a session that is still
+    // alive and idle here is tmux having accepted it.
+    try testing.expect(!session.exited);
+
+    // And tmux says so itself rather than us inferring it from silence.
+    const flags = try session.ask(&.{
+        "list-clients", "-F", "#{client_flags}",
+    });
+    defer alloc.free(flags);
+    try testing.expect(
+        std.mem.indexOf(u8, flags, "pause-after") != null,
+    );
 }
 
 test "live: detaching ends control mode and leaves the session running" {

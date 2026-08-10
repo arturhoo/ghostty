@@ -2455,6 +2455,27 @@ keybind: Keybinds = .{},
 /// Available since: 1.0.1
 @"title-report": bool = false,
 
+/// How many seconds of pane output tmux may hold for us before it pauses
+/// the pane, when attached to a tmux control mode session (`tmux -CC`).
+///
+/// This exists because of what tmux does *without* it. A control client
+/// that falls behind is not throttled: tmux buffers, and once the backlog
+/// passes five minutes it kills the client outright with `%exit too far
+/// behind`. Every window of the session closes at once. A command that
+/// produces a lot of output over a slow link is enough to trigger it.
+///
+/// With this set, tmux pauses the offending pane instead and tells us, and
+/// we resume it and re-read it. The session survives.
+///
+/// The cost is that output produced while a pane is paused is discarded by
+/// tmux rather than buffered, so the pane is re-read from its current
+/// contents: whatever scrolled past during the pause is not recoverable.
+/// That is why this is off by default and you have to ask for it.
+///
+/// Set to 0 to disable, which is the default. Requires tmux 3.2 or newer;
+/// older servers do not have the flag and are not sent it.
+@"tmux-pause-after": u32 = 0,
+
 /// The total amount of bytes that can be used for image data (e.g. the Kitty
 /// image protocol) per terminal screen. The maximum value is 4,294,967,295
 /// (4GiB). The default is 320MB. If this is set to zero, then all image
