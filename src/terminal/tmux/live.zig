@@ -963,6 +963,50 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: focusing a pane moves tmux's active pane" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .down } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // tmux makes the pane it just created the active one, so asking for
+    // the *other* one is a real change and not a no-op that would pass
+    // whatever we sent.
+    const active_after_split = try session.ask(&.{
+        "display-message", "-p", "#{pane_id}",
+    });
+    defer alloc.free(active_after_split);
+    try testing.expectEqualStrings(
+        "%1",
+        std.mem.trim(u8, active_after_split, " \r\n"),
+    );
+
+    try session.input(.{ .select_pane = .{ .pane_id = 0 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const active = try session.ask(&.{
+        "display-message", "-p", "#{pane_id}",
+    });
+    defer alloc.free(active);
+    try testing.expectEqualStrings("%0", std.mem.trim(u8, active, " \r\n"));
+    try testing.expect(!session.exited);
+}
+
 test "live: detaching ends control mode and leaves the session running" {
     if (!enabled()) return error.SkipZigTest;
 
