@@ -17,6 +17,7 @@ const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
 const renderer = @import("../../../renderer.zig");
 const terminal = @import("../../../terminal/main.zig");
+const termio = @import("../../../termio.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
 const ext = @import("../ext.zig");
@@ -737,6 +738,10 @@ pub const Surface = extern struct {
             command: ?configpkg.Command = null,
             working_directory: ?[:0]const u8 = null,
 
+            /// Set when this surface displays a tmux control mode pane
+            /// rather than running a process. Holds a router reference.
+            tmux: ?termio.Tmux.Pane = null,
+
             pub const none: @This() = .{};
         } = .none,
 
@@ -747,6 +752,7 @@ pub const Surface = extern struct {
         command: ?configpkg.Command = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        tmux: ?termio.Tmux.Pane = null,
 
         pub const none: @This() = .{};
     }) *Self {
@@ -758,8 +764,20 @@ pub const Surface = extern struct {
         priv.overrides = .{
             .command = if (overrides.command) |c| c.clone(alloc) catch null else null,
             .working_directory = if (overrides.working_directory) |wd| alloc.dupeZ(u8, wd) catch null else null,
+
+            // Our own reference, released in finalize. The core surface
+            // takes a further one when it builds its backend.
+            .tmux = if (overrides.tmux) |t| .{
+                .router = t.router.ref(),
+                .pane_id = t.pane_id,
+            } else null,
         };
         return self;
+    }
+
+    /// The tmux pane this surface displays, if it was created for one.
+    pub fn tmuxPane(self: *Self) ?termio.Tmux.Pane {
+        return self.private().overrides.tmux;
     }
 
     pub fn core(self: *Self) ?*CoreSurface {
@@ -1981,6 +1999,10 @@ pub const Surface = extern struct {
         if (priv.overrides.working_directory) |wd| {
             alloc.free(wd);
             priv.overrides.working_directory = null;
+        }
+        if (priv.overrides.tmux) |t| {
+            t.router.unref();
+            priv.overrides.tmux = null;
         }
 
         // Clean up key sequence and key table state
@@ -3522,6 +3544,12 @@ pub const Surface = extern struct {
             var wd_val: configpkg.WorkingDirectory = .{ .path = try config_alloc.dupe(u8, wd) };
             try wd_val.finalize(config_alloc);
             config.@"working-directory" = wd_val;
+        }
+        if (priv.overrides.tmux != null) {
+            // A tmux pane runs no process of ours, so neither a command
+            // nor any startup input has anywhere to go.
+            config.command = null;
+            config.input = .{};
         }
 
         // Properties that can impact surface init
