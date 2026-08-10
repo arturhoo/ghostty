@@ -272,6 +272,9 @@ pub const Viewer = struct {
         /// asked for a new tab.
         new_window: void,
 
+        /// Leave the session, because the user asked to detach.
+        detach: void,
+
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
@@ -535,6 +538,7 @@ pub const Viewer = struct {
             .resize => self.nextResize(input.resize),
             .client_size => self.nextClientSize(input.client_size),
             .new_window => self.nextNewWindow(),
+            .detach => self.nextDetach(),
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
@@ -888,6 +892,22 @@ pub const Viewer = struct {
 
         return self.queueUserCommand("new-window\n", .{}) catch {
             log.warn("failed to queue new-window", .{});
+            return &.{};
+        };
+    }
+
+    /// Leave the session.
+    ///
+    /// `detach-client` with no target is this client, which is what the
+    /// user meant: the session and everything running in it stays up,
+    /// and tmux answers by ending control mode. Teardown is the same
+    /// path a session that goes away any other way already takes, so
+    /// there is nothing to unwind here.
+    fn nextDetach(self: *Viewer) []const Action {
+        if (self.state != .command_queue) return &.{};
+
+        return self.queueUserCommand("detach-client\n", .{}) catch {
+            log.warn("failed to queue detach-client", .{});
             return &.{};
         };
     }
@@ -4128,6 +4148,21 @@ test "tmux resizing a pane forgets what we asked for" {
 
     try testing.expectEqual(30, pane.terminal.rows);
     try testing.expectEqual(null, pane.last_resize_request);
+}
+
+test "detaching asks tmux to detach this client" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            // No target: this client, which is the one that asked.
+            .input = .detach,
+            .contains_command = "detach-client\n",
+        },
+    });
 }
 
 test "a size tmux will not give us is not asked for twice" {

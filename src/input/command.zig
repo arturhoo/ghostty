@@ -453,6 +453,16 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Toggle the tab overview."),
         }},
 
+        // In the palette because it is unbound by default and this is
+        // the only way to reach it. It does nothing outside a tmux pane,
+        // which is the same as every other action that needs a
+        // particular kind of surface.
+        .tmux_detach => comptime &.{.{
+            .action = .tmux_detach,
+            .title = i18n.N_("Detach from tmux Session"),
+            .description = i18n.N_("Leave the tmux session, leaving everything in it running."),
+        }},
+
         .prompt_surface_title => comptime &.{.{
             .action = .prompt_surface_title,
             .title = i18n.N_("Change Terminal Title…"),

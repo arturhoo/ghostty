@@ -402,6 +402,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .newWindow = tmuxHostNewWindow,
     .split = tmuxHostSplit,
     .killWindows = tmuxHostKillWindows,
+    .detach = tmuxHostDetach,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -463,6 +464,11 @@ fn tmuxHostKillWindows(
         .pane_id = pane_id,
         .scope = scope,
     } });
+}
+
+fn tmuxHostDetach(ctx: *anyopaque) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.detach);
 }
 
 fn tmuxHostNewWindow(ctx: *anyopaque) void {

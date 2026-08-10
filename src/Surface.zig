@@ -2162,6 +2162,18 @@ fn tmuxNewWindow(self: *Surface) bool {
     return true;
 }
 
+/// Leave the tmux session this surface belongs to, if it belongs to one.
+///
+/// The pane is only how we reach the session; detaching is not about it.
+fn tmuxDetach(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.detach();
+    return true;
+}
+
 /// Ask tmux to split this pane, if this surface is one.
 fn tmuxSplit(
     self: *Surface,
@@ -5434,6 +5446,8 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .selection,
             v,
         ),
+
+        .tmux_detach => return self.tmuxDetach(),
 
         .new_tab => {
             // On a tmux pane, a new tab is a new tmux window: the point
