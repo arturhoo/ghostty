@@ -101,6 +101,10 @@ class AppDelegate: NSObject,
     /// The global undo manager for app-level state such as window restoration.
     lazy var undoManager = ExpiringUndoManager()
 
+    /// Builds native windows for tmux control mode windows. It listens for
+    /// layout notifications, so it only has to exist.
+    let tmuxWindowManager = TmuxWindowManager()
+
     /// The current state of the quick terminal.
     private var quickTerminalControllerState: QuickTerminalState = .uninitialized
 

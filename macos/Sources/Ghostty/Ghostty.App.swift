@@ -676,6 +676,9 @@ extension Ghostty {
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
                 return copyTitleToClipboard(app, target: target)
 
+            case GHOSTTY_ACTION_TMUX_WINDOWS:
+                tmuxWindows(app, target: target, v: action.action.tmux_windows)
+
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue, privacy: .public)")
                 return false
@@ -2047,6 +2050,34 @@ extension Ghostty {
                         object: surfaceView
                     )
                 }
+
+            default:
+                assertionFailure()
+            }
+        }
+
+        private static func tmuxWindows(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_tmux_windows_s) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                Ghostty.logger.warning("tmux windows does nothing with an app target")
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+
+                // The payload is borrowed for the duration of this
+                // callback, so it is copied before it goes anywhere.
+                let action = Ghostty.Action.TmuxWindows(c: v)
+
+                NotificationCenter.default.post(
+                    name: .ghosttyDidUpdateTmuxWindows,
+                    object: surfaceView,
+                    userInfo: [SwiftUI.Notification.Name.TmuxWindowsKey: action]
+                )
 
             default:
                 assertionFailure()
