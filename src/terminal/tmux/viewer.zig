@@ -293,6 +293,9 @@ pub const Viewer = struct {
         /// Tell tmux the user moved into this pane.
         select_pane: SelectPane,
 
+        /// Toggle whether this pane is zoomed, because the GUI asked.
+        zoom_pane: ZoomPane,
+
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
@@ -343,6 +346,10 @@ pub const Viewer = struct {
         };
 
         pub const SelectPane = struct {
+            pane_id: usize,
+        };
+
+        pub const ZoomPane = struct {
             pane_id: usize,
         };
 
@@ -575,6 +582,7 @@ pub const Viewer = struct {
             .new_window => self.nextNewWindow(),
             .detach => self.nextDetach(),
             .select_pane => self.nextSelectPane(input.select_pane),
+            .zoom_pane => self.nextZoomPane(input.zoom_pane),
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
@@ -923,6 +931,35 @@ pub const Viewer = struct {
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
         try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+    }
+
+    /// Ask tmux to toggle zoom on a pane.
+    ///
+    /// Nothing is changed here and nothing is remembered. tmux owns
+    /// whether a window is zoomed, answers with a `%layout-change`, and
+    /// that is what moves the GUI -- so the two cannot drift apart for
+    /// longer than one round trip. Toggling locally as well would show
+    /// the user a zoom that tmux had not agreed to.
+    ///
+    /// `-Z` is a toggle on the *window*, not on the pane: if some other
+    /// pane were zoomed, this unzooms rather than moving the zoom here.
+    /// Only the zoomed pane is rendered while a window is zoomed, so a
+    /// user cannot reach another pane to ask; a binding that jumps panes
+    /// makes tmux unzoom on its own first.
+    fn nextZoomPane(self: *Viewer, req: Input.ZoomPane) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (!self.panes.contains(req.pane_id)) {
+            log.info("zoom of unknown pane id={}, dropping", .{req.pane_id});
+            return &.{};
+        }
+
+        return self.queueUserCommand(
+            "resize-pane -Z -t %{d}\n",
+            .{req.pane_id},
+        ) catch {
+            log.warn("failed to queue resize-pane -Z", .{});
+            return &.{};
+        };
     }
 
     /// Tell tmux which pane the user is in.
@@ -4414,6 +4451,51 @@ test "a layout change forgets which pane we selected" {
 /// The two-pane vertical layout collapsed to just pane 1, which is what
 /// tmux reports as the visible layout while pane 1 is zoomed.
 const zoomed_to_pane_1 = "b7de,83x44,0,0,1";
+
+test "zooming a pane asks tmux rather than deciding here" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .zoom_pane = .{ .pane_id = 1 } },
+            .contains_command = "resize-pane -Z -t %1\n",
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // Nothing is decided locally: the window is zoomed
+                    // when tmux says it is, in the layout that answers
+                    // this. Setting it here would show the user a zoom
+                    // tmux might refuse.
+                    try testing.expectEqual(
+                        null,
+                        v.windows.items[0].zoomed_pane_id,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
+test "zooming a pane we do not have is dropped" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .zoom_pane = .{ .pane_id = 9 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+    });
+}
 
 test "a zoomed window keeps every pane it has" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});

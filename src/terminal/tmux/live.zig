@@ -974,6 +974,62 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: zooming a pane round-trips through tmux" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    try session.input(.{ .split = .{ .pane_id = 0, .direction = .down } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.panes.count() == 2 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    try session.input(.{ .zoom_pane = .{ .pane_id = 1 } });
+
+    // tmux answers with a layout, and that is what makes it true here.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items[0].zoomed_pane_id != null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    try testing.expectEqual(1, session.viewer.windows.items[0].zoomed_pane_id.?);
+
+    // tmux's own opinion, not ours.
+    {
+        const zoomed = try session.ask(&.{
+            "display-message", "-p", "#{window_zoomed_flag}",
+        });
+        defer alloc.free(zoomed);
+        try testing.expectEqualStrings("1", std.mem.trim(u8, zoomed, " \r\n"));
+    }
+
+    // Both panes are still here. A zoomed window's visible layout names
+    // only the zoomed pane, and this is what would break if that ever
+    // drove the pane diff.
+    try testing.expectEqual(2, session.viewer.panes.count());
+
+    // And it toggles back.
+    try session.input(.{ .zoom_pane = .{ .pane_id = 1 } });
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items[0].zoomed_pane_id == null and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    try testing.expectEqual(2, session.viewer.panes.count());
+    try testing.expect(!session.exited);
+}
+
 test "live: tmux changing window tells us, and settles" {
     if (!enabled()) return error.SkipZigTest;
 
