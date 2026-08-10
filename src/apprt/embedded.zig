@@ -1584,6 +1584,28 @@ pub const CAPI = struct {
         return surface.core_surface.tmuxRouter();
     }
 
+    /// Close the tmux window this surface's pane is in, if it is one.
+    ///
+    /// For close paths that originate in AppKit rather than in a binding:
+    /// macOS's Cmd+W, its Close Tab menu item and its window and tab
+    /// close buttons all reach `closeTabImmediately` directly, never
+    /// `performBindingAction`, so the core never learns that a tmux tab
+    /// was closed and never sends `kill-window`.
+    ///
+    /// Returns true if this is a tmux pane and the kill was sent. tmux
+    /// owns the close from that point: the caller must **not** also tear
+    /// the tab down locally. It goes away when tmux stops listing the
+    /// window, and closing it here as well leaves the window alive on the
+    /// server with nothing showing it -- which the next notification
+    /// answers by building the tab all over again.
+    ///
+    /// Returns false for anything that is not a tmux pane, the surface
+    /// hosting the session included. Close it however you normally would.
+    export fn ghostty_surface_tmux_close_tab(surface: *Surface) bool {
+        if (comptime !terminal.options.tmux_control_mode) return false;
+        return surface.core_surface.tmuxCloseTab(.this);
+    }
+
     /// Release a reference from ghostty_surface_tmux_router that was not
     /// handed to a surface config.
     export fn ghostty_tmux_router_free(router_: ?*anyopaque) void {
