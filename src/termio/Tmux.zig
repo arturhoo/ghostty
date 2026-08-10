@@ -108,13 +108,22 @@ pub fn focusGained(
     td: *termio.Termio.ThreadData,
     focused: bool,
 ) !void {
-    _ = self;
     _ = td;
-    _ = focused;
 
     // Exec uses this to poll the pty's termios for password prompts,
     // which needs a pty. The focus escape sequences themselves are
     // emitted above the backend.
+
+    // Tell tmux which pane the user is in, so that anything it does with
+    // its own notion of the active pane -- a `split-window` typed in
+    // another client, a script running `send-keys` without a target --
+    // lands where the user is looking.
+    //
+    // On gaining focus only. Losing it says nothing about where focus
+    // went: it may have left ghostty altogether, and tmux always has
+    // some pane active, so there is nothing to report.
+    if (!focused) return;
+    self.router.selectPane(self.pane_id);
 }
 
 pub fn resize(
