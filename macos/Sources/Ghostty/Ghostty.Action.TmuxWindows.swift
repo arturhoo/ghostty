@@ -24,6 +24,11 @@ extension Ghostty.Action {
 
             let width: Int
             let height: Int
+
+            /// The pane filling this window because it is zoomed, if one
+            /// is. Every other pane in `nodes` still exists; zoom only
+            /// decides what is rendered.
+            let zoomedPaneId: Int?
             let nodes: [Node]
 
             /// The first pane in tree order. Children of a split are
@@ -107,6 +112,7 @@ extension Ghostty.Action {
                     active: cWindow.active,
                     width: cWindow.width,
                     height: cWindow.height,
+                    zoomedPaneId: cWindow.zoomed ? cWindow.zoomed_pane_id : nil,
                     nodes: nodes)
             }
         }

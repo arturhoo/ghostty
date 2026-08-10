@@ -47,6 +47,15 @@ pub const WindowSet = struct {
         width: usize,
         height: usize,
 
+        /// Whether a pane is zoomed, and which. Two fields rather than an
+        /// optional because this is extern: `zoomed_pane_id` means
+        /// nothing unless `zoomed` is set.
+        ///
+        /// A GUI should render only this pane, filling the window. Every
+        /// other pane in `nodes` still exists and must be kept.
+        zoomed: bool,
+        zoomed_pane_id: usize,
+
         /// The layout tree, flattened. Index 0 is the root. This is never
         /// empty: a window always has at least one pane.
         nodes: [*]const Node,
@@ -150,6 +159,8 @@ pub const WindowSet = struct {
                 .name = try alloc.dupeZ(u8, src.name),
                 .width = src.width,
                 .height = src.height,
+                .zoomed = src.zoomed_pane_id != null,
+                .zoomed_pane_id = src.zoomed_pane_id orelse 0,
                 .nodes = owned.ptr,
                 .nodes_len = owned.len,
             };
@@ -230,6 +241,7 @@ fn testWindow(
         .id = id,
         .name = "",
         .active = false,
+        .zoomed_pane_id = null,
         .width = width,
         .height = height,
         .layout_arena = arena.state,
