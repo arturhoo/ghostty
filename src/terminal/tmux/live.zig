@@ -1042,6 +1042,66 @@ test "live: a new tab is a new tmux window" {
     try testing.expect(!session.exited);
 }
 
+test "live: moving a tab reorders tmux's windows" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // Two more windows, so there is somewhere to move to.
+    for (0..2) |_| {
+        const out = try session.ask(&.{ "new-window", "-d", "sleep 60" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len == 3 and
+                v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    const first = session.viewer.windows.items[0].id;
+    const second = session.viewer.windows.items[1].id;
+
+    // The pane in the first window, moved one to the right.
+    const pane = session.viewer.windows.items[0].layout.content.pane;
+    try session.input(.{ .move_window = .{ .pane_id = pane, .amount = 1 } });
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    // tmux's order, asked of tmux. The two windows have exchanged
+    // places and the third has not moved.
+    const order = try session.ask(&.{
+        "list-windows", "-F", "#{window_id}",
+    });
+    defer alloc.free(order);
+
+    var it = std.mem.tokenizeScalar(u8, order, '\n');
+    const line_one = std.mem.trim(u8, it.next() orelse return error.NoWindows, " \r");
+    const line_two = std.mem.trim(u8, it.next() orelse return error.NoWindows, " \r");
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(&buf, "@{d}", .{second}),
+        line_one,
+    );
+
+    var buf2: [16]u8 = undefined;
+    try testing.expectEqualStrings(
+        try std.fmt.bufPrint(&buf2, "@{d}", .{first}),
+        line_two,
+    );
+
+    try testing.expect(!session.exited);
+}
+
 test "live: zooming a pane round-trips through tmux" {
     if (!enabled()) return error.SkipZigTest;
 
