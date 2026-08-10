@@ -296,6 +296,9 @@ pub const Viewer = struct {
         /// Toggle whether this pane is zoomed, because the GUI asked.
         zoom_pane: ZoomPane,
 
+        /// Move this pane's window along the session's window order.
+        move_window: MoveWindow,
+
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
@@ -351,6 +354,16 @@ pub const Viewer = struct {
 
         pub const ZoomPane = struct {
             pane_id: usize,
+        };
+
+        pub const MoveWindow = struct {
+            /// A pane in the window being moved. The surface knows which
+            /// pane it is and nothing else.
+            pane_id: usize,
+
+            /// How far to move, in windows, signed. Relative because
+            /// that is what the GUI verb is: "one to the left".
+            amount: isize,
         };
 
         pub const KillPane = struct {
@@ -583,6 +596,7 @@ pub const Viewer = struct {
             .detach => self.nextDetach(),
             .select_pane => self.nextSelectPane(input.select_pane),
             .zoom_pane => self.nextZoomPane(input.zoom_pane),
+            .move_window => self.nextMoveWindow(input.move_window),
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
@@ -931,6 +945,50 @@ pub const Viewer = struct {
         var arena = self.action_arena.promote(self.alloc);
         defer self.action_arena = arena.state;
         try actions.append(arena.allocator(), .{ .windows = self.windows.items });
+    }
+
+    /// Move a window along the session's window order.
+    ///
+    /// `swap-window` rather than `move-window`: swapping exchanges two
+    /// windows' indexes and leaves every other window where it was,
+    /// which is what dragging a tab one place along means. `move-window`
+    /// renumbers, and with no free index it fails outright.
+    ///
+    /// The neighbour is resolved from the viewer's own ordered window
+    /// list rather than by arithmetic on tmux indexes, because those are
+    /// sparse: killing window 1 of 0,1,2 leaves 0,2, and "one to the
+    /// right of 0" is 2, not 1.
+    ///
+    /// Moving past either end does nothing. A tab at the end that
+    /// silently stays there is what every other tab strip does.
+    fn nextMoveWindow(self: *Viewer, req: Input.MoveWindow) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (req.amount == 0) return &.{};
+
+        const window = self.windowForPane(req.pane_id) orelse {
+            log.info("move for pane id={} in no window", .{req.pane_id});
+            return &.{};
+        };
+
+        const from: isize = for (self.windows.items, 0..) |w, i| {
+            if (w.id == window.id) break @intCast(i);
+        } else return &.{};
+
+        const to = from + req.amount;
+        if (to < 0 or to >= self.windows.items.len) return &.{};
+
+        const target = self.windows.items[@intCast(to)];
+        if (target.id == window.id) return &.{};
+
+        // -d so the swap does not drag the current window along with it:
+        // moving a tab is not a request to look at it.
+        return self.queueUserCommand(
+            "swap-window -d -s @{d} -t @{d}\n",
+            .{ window.id, target.id },
+        ) catch {
+            log.warn("failed to queue swap-window", .{});
+            return &.{};
+        };
     }
 
     /// Ask tmux to toggle zoom on a pane.
@@ -4451,6 +4509,116 @@ test "a layout change forgets which pane we selected" {
 /// The two-pane vertical layout collapsed to just pane 1, which is what
 /// tmux reports as the visible layout while pane 1 is zoomed.
 const zoomed_to_pane_1 = "b7de,83x44,0,0,1";
+
+/// Startup for three windows, deliberately at sparse tmux indexes: ids
+/// @0, @5 and @9, in that order. Real sessions look like this as soon as
+/// a window in the middle is killed.
+fn testThreeWindowSteps() []const TestStep {
+    return &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+        .{ .input = .{ .tmux = .{
+            .block_end =
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
+            \\$0 @5 0 83 44 b7de,83x44,0,0,1 0 b7de,83x44,0,0,1
+            \\$0 @9 0 83 44 b7df,83x44,0,0,2 0 b7df,83x44,0,0,2
+            ,
+        } } },
+        // Four capture-pane replies per pane, plus pane_state.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+    };
+}
+
+test "moving a tab swaps with its neighbour in tmux's order" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testThreeWindowSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 0 is in @0. One to the right is @5 -- the *next window in
+        // the list*, not index 1, which does not exist. Arithmetic on
+        // tmux's own indexes would target a window that is not there.
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = 1 } },
+            .contains_command = "swap-window -d -s @0 -t @5\n",
+        },
+    });
+}
+
+test "a tab at the end stays there" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testThreeWindowSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Pane 0 is the first window, so there is nothing to its left.
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = -1 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+
+        // And past the far end from the last window.
+        .{
+            .input = .{ .move_window = .{ .pane_id = 2, .amount = 1 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+
+        // Further than the list is long is the same answer, not a wrap
+        // and not a clamp onto some other window.
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = 99 } },
+            .check = (struct {
+                fn check(_: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                }
+            }).check,
+        },
+    });
+}
+
+test "moving a tab two along skips the one between" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testThreeWindowSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .move_window = .{ .pane_id = 0, .amount = 2 } },
+            .contains_command = "swap-window -d -s @0 -t @9\n",
+        },
+    });
+}
 
 test "zooming a pane asks tmux rather than deciding here" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{});

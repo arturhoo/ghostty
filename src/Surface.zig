@@ -2162,6 +2162,16 @@ fn tmuxNewWindow(self: *Surface) bool {
     return true;
 }
 
+/// Ask tmux to move this pane's window, if this surface is a pane.
+fn tmuxMoveWindow(self: *Surface, amount: isize) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.moveWindow(pane.id, amount);
+    return true;
+}
+
 /// Ask tmux to toggle zoom on this pane, if this surface is one.
 fn tmuxZoom(self: *Surface) bool {
     if (comptime !terminal.options.tmux_control_mode) return false;
@@ -5511,11 +5521,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             },
         ),
 
-        .move_tab => |position| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .move_tab,
-            .{ .amount = position },
-        ),
+        .move_tab => |position| {
+            // A tmux window's place in the tab strip is its place in
+            // tmux's window order, so moving the tab means moving the
+            // window. Reordering only the native tabs would disagree
+            // with the session, and with every other client of it.
+            if (self.tmuxMoveWindow(position)) return true;
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .move_tab,
+                .{ .amount = position },
+            );
+        },
 
         .move_tab_to_new_window => return try self.rt_app.performAction(
             .{ .surface = self },
