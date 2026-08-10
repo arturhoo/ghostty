@@ -266,7 +266,31 @@ pub const Tab = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const title = std.mem.span(title_ptr);
-        self.setTitleOverride(if (title.len == 0) null else title);
+
+        // Through the core rather than straight onto the override. The
+        // action lands back here as `set_tab_title` -> `setTitleOverride`,
+        // so the result is the same, but it gives the core the one thing
+        // it did not have: the title the user chose. Every other place a
+        // title is set already goes this way.
+        //
+        // Falling back to setting it directly keeps a tab with no surface
+        // -- which should not happen, but is not worth losing a rename
+        // over -- behaving as it did.
+        const surface = self.getActiveSurface() orelse {
+            self.setTitleOverride(if (title.len == 0) null else title);
+            return;
+        };
+        const core_surface = surface.core() orelse {
+            self.setTitleOverride(if (title.len == 0) null else title);
+            return;
+        };
+
+        _ = core_surface.performBindingAction(.{
+            .set_tab_title = title,
+        }) catch |err| {
+            log.warn("error setting tab title err={}", .{err});
+            self.setTitleOverride(if (title.len == 0) null else title);
+        };
     }
     pub fn promptTabTitle(self: *Self) void {
         const priv = self.private();
