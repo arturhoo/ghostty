@@ -18,6 +18,10 @@ extension Ghostty.Action {
             /// action callback.
             let name: String
 
+            /// Whether tmux is currently on this window. At most one
+            /// window in a set has it.
+            let active: Bool
+
             let width: Int
             let height: Int
             let nodes: [Node]
@@ -100,6 +104,7 @@ extension Ghostty.Action {
                 return Window(
                     id: cWindow.id,
                     name: cWindow.name.map { String(cString: $0) } ?? "",
+                    active: cWindow.active,
                     width: cWindow.width,
                     height: cWindow.height,
                     nodes: nodes)

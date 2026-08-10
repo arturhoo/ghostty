@@ -32,6 +32,12 @@ pub const WindowSet = struct {
         /// The tmux window ID. Stable for the lifetime of a viewer.
         id: usize,
 
+        /// Whether this is the window tmux is currently on. At most one
+        /// window in a set has this. A GUI showing the session should
+        /// bring it forward; it changes when the user moves between
+        /// windows in any client, including this one.
+        active: bool,
+
         /// The window's tmux name, NUL terminated so a C caller can use
         /// it directly. Owned by the set's arena; valid until the set is
         /// destroyed. Never null: an unnamed window is an empty string.
@@ -140,6 +146,7 @@ pub const WindowSet = struct {
             const owned = try nodes.toOwnedSlice(alloc);
             dst.* = .{
                 .id = src.id,
+                .active = src.active,
                 .name = try alloc.dupeZ(u8, src.name),
                 .width = src.width,
                 .height = src.height,
@@ -222,6 +229,7 @@ fn testWindow(
     return .{
         .id = id,
         .name = "",
+        .active = false,
         .width = width,
         .height = height,
         .layout_arena = arena.state,
