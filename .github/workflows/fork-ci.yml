@@ -93,3 +93,77 @@ jobs:
           fi
           tmux -V
           zig build test-tmux-live -Dapp-runtime=none --summary all
+
+  # The same live tests, against the oldest tmux we claim to work with.
+  #
+  # Two behaviours in the viewer exist only for old servers, so the
+  # runner's own tmux can never reach them: window sizing falls back to
+  # `resize-window` below 3.4, where per-window `refresh-client -C` does
+  # not exist, and `pause-after` is not sent below 3.2 at all. A version
+  # gate is a branch the newer tmux never takes, which is the definition
+  # of untested.
+  #
+  # 3.2a because that is what Ubuntu 22.04 LTS ships, which is what the
+  # sizing fallback was written for, and because it is exactly the floor
+  # the pause-after gate names -- so that gate is checked on its own
+  # boundary rather than well inside it.
+  #
+  # Its own job rather than another step in `test`: that job already
+  # spends around 27 of its 30 minutes, and a second live run plus a
+  # tmux build does not fit. This way the two run side by side and
+  # neither can push the other over.
+  test-tmux-32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Get required Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      # As the `test` job, plus what building tmux needs.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq -y --no-install-recommends install \
+            bison \
+            build-essential \
+            libbz2-dev \
+            libevent-dev \
+            libncurses-dev \
+            libonig-dev \
+            libxml2-utils \
+            pandoc
+
+      # Built from source: every distro the runner can reach has moved
+      # past 3.2a. About a minute.
+      - name: Build tmux 3.2a
+        run: |
+          curl -fsSL -o /tmp/tmux.tar.gz \
+            https://github.com/tmux/tmux/releases/download/3.2a/tmux-3.2a.tar.gz
+          tar -xzf /tmp/tmux.tar.gz -C /tmp
+          cd /tmp/tmux-3.2a
+          ./configure --prefix="$HOME/tmux32" >/dev/null
+          make -j"$(nproc)" >/dev/null
+          make install >/dev/null
+
+      # Skipped rather than failed on branches that predate the build
+      # step, same as the `test` job. Drop the guard once it is on main.
+      - name: zig build test-tmux-live (tmux 3.2a)
+        run: |
+          if ! zig build -h 2>&1 | grep -q 'test-tmux-live'; then
+            echo "no test-tmux-live step on this branch, skipping"
+            exit 0
+          fi
+
+          export PATH="$HOME/tmux32/bin:$PATH"
+          tmux -V | grep -q '3.2a' || { echo "wrong tmux: $(tmux -V)"; exit 1; }
+          zig build test-tmux-live -Dapp-runtime=none --summary all
