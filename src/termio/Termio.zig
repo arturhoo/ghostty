@@ -69,6 +69,19 @@ terminal_stream: StreamHandler.Stream,
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
 
+/// How many tmux window snapshots we have pushed to the surface.
+///
+/// Stamped onto each one so the surface can tell a snapshot that is
+/// still the newest from one that has already been overtaken. Written
+/// only by the io thread; read by the main thread, which is why it is
+/// atomic rather than a plain integer.
+tmux_windows_seq: if (terminalpkg.options.tmux_control_mode)
+    std.atomic.Value(u64)
+else
+    void = if (terminalpkg.options.tmux_control_mode)
+    .init(0)
+else {},
+
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,

@@ -114,9 +114,21 @@ pub const Message = union(enum) {
     ///
     /// The receiver owns the snapshot and must `destroy` it.
     tmux_windows: if (terminal.options.tmux_control_mode)
-        *terminal.tmux.WindowSet
+        TmuxWindows
     else
         void,
+
+    /// A tmux window snapshot and where it sits in the sequence of them.
+    ///
+    /// The sequence number exists so a snapshot that has already been
+    /// overtaken can be dropped rather than applied. See `Surface`'s
+    /// handler: applying a superseded one walks the GUI through layouts
+    /// tmux has already left, and the GUI answers each of them with a
+    /// resize, which is a feedback loop rather than a stale frame.
+    pub const TmuxWindows = struct {
+        set: *terminal.tmux.WindowSet,
+        seq: u64,
+    };
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
