@@ -367,6 +367,13 @@ pub const Viewer = struct {
         /// round trip to `list-windows`.
         name: []const u8,
 
+        /// The pane filling this window because it is zoomed, if one is.
+        ///
+        /// Only ever read from tmux, never set here: zoom is a fact about
+        /// the tmux window, and a GUI that toggled it locally would
+        /// disagree with the session until the next layout arrived.
+        zoomed_pane_id: ?usize = null,
+
         /// Whether tmux is currently on this window. Kept on the window
         /// rather than as one id on the viewer because that is the shape
         /// the GUI reads it in, and it cannot then disagree with the set
@@ -717,6 +724,52 @@ pub const Viewer = struct {
             if (layoutContainsPane(window.layout, pane_id)) return window;
         }
         return null;
+    }
+
+    /// The first pane in a layout, in tree order.
+    ///
+    /// Used on a *visible* layout, where tmux collapses a zoomed window
+    /// to the single pane it is showing, so "first" is "the zoomed one".
+    fn firstPaneId(node: Layout) ?usize {
+        return switch (node.content) {
+            .pane => |id| id,
+            .horizontal, .vertical => |children| for (children) |child| {
+                if (firstPaneId(child)) |id| break id;
+            } else null,
+        };
+    }
+
+    /// The pane a window is zoomed to, from tmux's own account of it.
+    ///
+    /// `flags` is tmux's window flags string, where 'Z' means zoomed.
+    /// Only 'Z' is read: tmux formats these against the window's first
+    /// winlink, so the session flags in there ('*', '-') are not
+    /// necessarily true of *this* client.
+    ///
+    /// The pane comes from the visible layout rather than from tmux's
+    /// active pane, which we only learn lazily and only for the current
+    /// window -- a window already zoomed when we attached would have no
+    /// active pane recorded at all.
+    ///
+    /// A visible layout we cannot parse means unzoomed, not fatal: this
+    /// decides how a window is drawn, and drawing it unzoomed is a great
+    /// deal better than ending the session over it.
+    pub fn zoomedPane(
+        alloc: Allocator,
+        flags: []const u8,
+        visible_layout: []const u8,
+    ) ?usize {
+        if (std.mem.indexOfScalar(u8, flags, 'Z') == null) return null;
+
+        const layout = Layout.parseWithChecksum(alloc, visible_layout) catch {
+            log.info(
+                "failed to parse visible layout, treating as unzoomed: {s}",
+                .{visible_layout},
+            );
+            return null;
+        };
+
+        return firstPaneId(layout);
     }
 
     fn layoutContainsPane(node: Layout, pane_id: usize) bool {
@@ -1387,6 +1440,8 @@ pub const Viewer = struct {
                 &actions,
                 info.window_id,
                 info.layout,
+                info.raw_flags,
+                info.visible_layout,
             ) catch {
                 // Note: in the future, we can probably handle a failure
                 // here with a fallback to remove this one window, list
@@ -1516,6 +1571,8 @@ pub const Viewer = struct {
         actions: *std.ArrayList(Action),
         window_id: usize,
         layout_str: []const u8,
+        flags: []const u8,
+        visible_layout_str: []const u8,
     ) !void {
         // Find the window this layout change is for.
         const window: *Window = window: for (self.windows.items) |*w| {
@@ -1530,6 +1587,18 @@ pub const Viewer = struct {
             var arena = window.layout_arena.promote(self.alloc);
             defer window.layout_arena = arena.state;
             _ = arena.reset(.retain_capacity);
+
+            // The zoomed pane comes out of the *visible* layout, which is
+            // only ever read for this. syncLayouts below still diffs the
+            // real layout: a zoomed window's visible layout lists one
+            // pane, and treating that as the set of panes that exist
+            // would destroy every other pane in the window.
+            window.zoomed_pane_id = zoomedPane(
+                arena.allocator(),
+                flags,
+                visible_layout_str,
+            );
+
             break :layout Layout.parseWithChecksum(
                 arena.allocator(),
                 layout_str,
@@ -1932,6 +2001,11 @@ pub const Viewer = struct {
                 .id = data.window_id,
                 .name = name,
                 .active = data.window_active,
+                .zoomed_pane_id = if (data.window_zoomed_flag) zoomedPane(
+                    window_alloc,
+                    "Z",
+                    data.window_visible_layout,
+                ) else null,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
@@ -2496,6 +2570,8 @@ const Format = struct {
             .window_width,
             .window_height,
             .window_layout,
+            .window_zoomed_flag,
+            .window_visible_layout,
             // Last on purpose: a window name can contain spaces, so it
             // is parsed as the rest of the line.
             .window_name,
@@ -2636,7 +2712,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$1 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$1 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2683,7 +2759,7 @@ test "session changed resets state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$2 @1 0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$2 @1 0 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2735,7 +2811,7 @@ test "initial flow" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -2902,7 +2978,7 @@ test "capture replay decodes escaped escape sequences" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 80 24 b25d,80x24,0,0,0
+                \\$0 @0 1 80 24 b25d,80x24,0,0,0 0 b25d,80x24,0,0,0
                 ,
             } },
             .check_command = (struct {
@@ -2975,7 +3051,7 @@ test "layout change" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3046,7 +3122,7 @@ test "layout_change does not return command when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3107,7 +3183,7 @@ test "layout_change returns command when queue was empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3174,7 +3250,7 @@ test "window_add queues list_windows when queue empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3235,7 +3311,7 @@ test "window_add queues list_windows when queue not empty" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3297,7 +3373,7 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
+                \\$0 @0 1 165 79 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4] 0 ca97,165x79,0,0[165x40,0,0,0,165x38,0,41,4]
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3471,7 +3547,7 @@ test "write sends keys to the target pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3528,7 +3604,7 @@ test "write waits for the in-flight command" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3587,7 +3663,7 @@ test "write to an unknown pane is dropped" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .contains_tags = &.{ .windows, .command },
@@ -3793,7 +3869,7 @@ fn testSinglePaneSteps() []const TestStep {
         .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
             ,
         } } },
         // Four capture-pane replies plus pane_state.
@@ -3820,7 +3896,9 @@ fn testTwoPaneSteps(comptime layout: []const u8) []const TestStep {
             .name = "test",
         } } } },
         .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
-        .{ .input = .{ .tmux = .{ .block_end = "$0 @0 1 83 44 " ++ layout } } },
+        .{ .input = .{ .tmux = .{
+            .block_end = "$0 @0 1 83 44 " ++ layout ++ " 0 " ++ layout,
+        } } },
         // Four capture-pane replies per pane.
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -4333,6 +4411,124 @@ test "a layout change forgets which pane we selected" {
     });
 }
 
+/// The two-pane vertical layout collapsed to just pane 1, which is what
+/// tmux reports as the visible layout while pane 1 is zoomed.
+const zoomed_to_pane_1 = "b7de,83x44,0,0,1";
+
+test "a zoomed window keeps every pane it has" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{
+                .tmux = .{
+                    .layout_change = .{
+                        .window_id = 0,
+                        .layout = two_panes_vertical,
+                        // tmux collapses this to the zoomed pane alone.
+                        .visible_layout = zoomed_to_pane_1,
+                        .raw_flags = "*Z",
+                    },
+                },
+            },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(
+                        1,
+                        v.windows.items[0].zoomed_pane_id.?,
+                    );
+
+                    // The assertion this test exists for. The visible
+                    // layout names one pane; if it ever drives the pane
+                    // diff, the other pane's terminal is destroyed and
+                    // unzooming rebuilds it empty.
+                    try testing.expectEqual(2, v.panes.count());
+                    try testing.expect(v.panes.contains(0));
+                    try testing.expect(v.panes.contains(1));
+                }
+            }).check,
+        },
+
+        // Unzoom: same layout, no Z.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = two_panes_vertical,
+                .visible_layout = two_panes_vertical,
+                .raw_flags = "*",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(
+                        null,
+                        v.windows.items[0].zoomed_pane_id,
+                    );
+                    try testing.expectEqual(2, v.panes.count());
+                }
+            }).check,
+        },
+    });
+}
+
+test "a window already zoomed when we attach arrives zoomed" {
+    var viewer = try Viewer.init(testing.io, testing.allocator, .{});
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .session_changed = .{
+            .id = 1,
+            .name = "test",
+        } } } },
+        .{ .input = .{ .tmux = .{ .block_end = "3.5a" } } },
+
+        // list-windows, with the zoom flag set. Nothing has told us which
+        // pane is active, which is exactly why the pane is read out of
+        // the visible layout instead.
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$0 @0 1 83 44 " ++ two_panes_vertical ++
+                    " 1 " ++ zoomed_to_pane_1,
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(
+                        1,
+                        v.windows.items[0].zoomed_pane_id.?,
+                    );
+                    try testing.expectEqual(2, v.panes.count());
+                }
+            }).check,
+        },
+    });
+}
+
+test "only the Z flag means zoomed" {
+    const alloc = testing.allocator;
+
+    // '*' is the current-window flag and '-' the last-window one. tmux
+    // formats those against the window's first winlink, so they say
+    // nothing reliable about this client and must not be read.
+    try testing.expectEqual(
+        null,
+        Viewer.zoomedPane(alloc, "*-", zoomed_to_pane_1),
+    );
+    try testing.expectEqual(
+        1,
+        Viewer.zoomedPane(alloc, "*Z", zoomed_to_pane_1).?,
+    );
+
+    // A visible layout we cannot parse is drawn unzoomed rather than
+    // ending the session.
+    try testing.expectEqual(
+        null,
+        Viewer.zoomedPane(alloc, "Z", "not a layout"),
+    );
+}
+
 test "pause mode is asked for once the version allows it" {
     var viewer = try Viewer.init(testing.io, testing.allocator, .{
         .pause_after = 30,
@@ -4495,7 +4691,7 @@ test "an old tmux sizes windows the old way" {
         .{ .input = .{ .tmux = .{ .block_end = "3.3a" } } },
         .{ .input = .{ .tmux = .{
             .block_end =
-            \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+            \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
             ,
         } } },
         .{ .input = .{ .tmux = .{ .block_end = "" } } },
@@ -4919,7 +5115,7 @@ test "layout change resizes a surviving pane" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 b7dd,83x44,0,0,0
+                \\$0 @0 1 83 44 b7dd,83x44,0,0,0 0 b7dd,83x44,0,0,0
                 ,
             } },
             .check = (struct {
@@ -4974,7 +5170,7 @@ test "list-windows windows action outlives the parse" {
         .{
             .input = .{ .tmux = .{
                 .block_end =
-                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
+                \\$0 @0 1 83 44 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1] 0 027b,83x44,0,0[83x20,0,0,0,83x23,0,21,1]
                 ,
             } },
             .contains_tags = &.{.windows},

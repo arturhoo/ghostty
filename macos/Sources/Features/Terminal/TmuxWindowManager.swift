@@ -90,7 +90,19 @@ class TmuxWindowManager {
                 continue
             }
 
-            let tree = SplitTree<Ghostty.SurfaceView>(root: root, zoomed: nil)
+            // Zoom renders one pane in place of the whole tree. Every
+            // other pane is still in `root` and still alive: this picks
+            // which node is drawn, it does not prune anything.
+            let zoomed: SplitTree<Ghostty.SurfaceView>.Node? = {
+                guard let paneId = window.zoomedPaneId,
+                      let view = panes[Key(host: host, id: paneId)]?.value
+                else { return nil }
+
+                // Against the tree being built, not the one on screen.
+                return root.node(view: view)
+            }()
+
+            let tree = SplitTree<Ghostty.SurfaceView>(root: root, zoomed: zoomed)
             let key = Key(host: host, id: window.id)
 
             if let controller = windows[key]?.value {
@@ -99,7 +111,13 @@ class TmuxWindowManager {
                 // including ones that changed nothing, and reassigning the
                 // tree tears views out of the hierarchy and puts them back.
                 // SplitTree is not Equatable, but its nodes are.
-                if controller.surfaceTree.root != tree.root {
+                //
+                // Zoom has to be part of that comparison. tmux's
+                // window_layout does not change when a pane zooms -- that
+                // is the whole point of it -- so the roots compare equal
+                // and a zoom toggle would never reach the screen.
+                if controller.surfaceTree.root != tree.root ||
+                    controller.surfaceTree.zoomed != tree.zoomed {
                     controller.surfaceTree = tree
                     keepFocusInWindow(window, of: controller, host: host)
                 }

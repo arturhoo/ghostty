@@ -159,6 +159,25 @@ fn syncWindow(
     var tree = try self.buildTree(plan);
     defer tree.deinit();
 
+    // Zoom is a property of the tree we are about to hand over, not
+    // something applied afterwards: `buildTree` always produces an
+    // unzoomed one, so a window that stays zoomed across a layout change
+    // would silently unzoom on every sync without this.
+    //
+    // Every pane is still in the tree and still alive. Zoom only decides
+    // which node the widget renders from.
+    if (window.zoomed) zoom: {
+        const surface = self.panes.getPtr(window.zoomed_pane_id) orelse
+            break :zoom;
+        const view = surface.get() orelse break :zoom;
+        defer view.unref();
+
+        // Pointer equality against the tree we just built, so this has to
+        // be the same surface `buildTree` put in it -- which it is, both
+        // coming from the panes map.
+        tree.zoom(tree.locate(view) orelse break :zoom);
+    }
+
     // One call: an intermediate empty tree would close the tab.
     tab.getSplitTree().setTree(&tree);
 }

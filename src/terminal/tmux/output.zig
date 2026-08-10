@@ -172,6 +172,14 @@ pub const Variable = enum {
     window_width,
     /// Height of window.
     window_height,
+    /// Whether a pane in this window is zoomed.
+    window_zoomed_flag,
+    /// Window layout description as it is actually displayed. Identical to
+    /// `window_layout` unless a pane is zoomed, in which case it is a
+    /// single leaf holding only the zoomed pane. Parse it for that pane
+    /// id and nothing else -- it is not a description of which panes
+    /// exist, and treating it as one destroys the others.
+    window_visible_layout,
     /// Window layout description, ignoring zoomed window panes. Format is
     /// `<checksum>,<layout>` where checksum is a 4-digit hex CRC16 and layout
     /// encodes pane dimensions as `WxH,X,Y[,ID]` with `{...}` for horizontal
@@ -200,6 +208,7 @@ pub const Variable = enum {
             .mouse_utf8_flag,
             .origin_flag,
             .window_active,
+            .window_zoomed_flag,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -228,6 +237,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_visible_layout,
             .window_name,
             => value,
         };
@@ -237,6 +247,7 @@ pub const Variable = enum {
     pub fn Type(comptime self: Variable) type {
         return switch (self) {
             .window_active,
+            .window_zoomed_flag,
             .alternate_on,
             .bracketed_paste,
             .cursor_blinking,
@@ -271,6 +282,7 @@ pub const Variable = enum {
             .pane_tabs,
             .version,
             .window_layout,
+            .window_visible_layout,
             .window_name,
             => []const u8,
         };
