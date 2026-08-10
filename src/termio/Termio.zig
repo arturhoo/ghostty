@@ -289,6 +289,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
+        .tmux_host = if (comptime StreamHandler.tmux_enabled) self else {},
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -315,7 +316,92 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     };
 }
 
+/// How the tmux router asks us to talk to the tmux server.
+///
+/// Every one of these runs on a pane's thread with no lock held, so they
+/// each take our renderer mutex for the duration of the viewer call. The
+/// router guarantees we are not called after `detachHost` returns.
+pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
+    .write = tmuxHostWrite,
+    .resize = tmuxHostResize,
+    .kill = tmuxHostKill,
+};
+
+/// Feed one input to the viewer and send whatever command it produces.
+///
+/// The viewer returns at most one action for these inputs, and its arena
+/// is reset by the next call, so the command has to be copied before we
+/// let go of the lock. `Message.writeReq` does that copy.
+fn tmuxHostInput(self: *Termio, input: terminalpkg.tmux.Viewer.Input) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+
+    const viewer = self.terminal_stream.handler.tmux_viewer orelse {
+        self.renderer_state.mutex.unlock(global.io());
+        return;
+    };
+
+    for (viewer.next(input)) |action| switch (action) {
+        .command => |cmd| {
+            const msg = termio.Message.writeReq(self.alloc, cmd) catch break;
+
+            // Passing our mutex is the messageWriter idiom: if the
+            // mailbox is full, the lock released while we wait is ours,
+            // which is the one the drain thread needs.
+            self.mailbox.send(msg, self.renderer_state.mutex);
+        },
+
+        else => {},
+    };
+
+    self.renderer_state.mutex.unlock(global.io());
+    self.mailbox.notify();
+}
+
+fn tmuxHostWrite(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .write = .{ .pane_id = pane_id, .data = data } });
+}
+
+fn tmuxHostResize(
+    ctx: *anyopaque,
+    pane_id: usize,
+    cols: usize,
+    rows: usize,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .resize = .{
+        .pane_id = pane_id,
+        .cols = cols,
+        .rows = rows,
+    } });
+}
+
+fn tmuxHostKill(ctx: *anyopaque, pane_id: usize) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+
+    // Detach first so the pane's sink is closed before tmux prunes it,
+    // otherwise the pane's own removal would be mirrored back at a
+    // display that is already gone.
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        if (self.terminal_stream.handler.tmux_viewer) |viewer| {
+            viewer.detachPane(pane_id);
+        }
+    }
+
+    self.tmuxHostInput(.{ .kill_pane = .{ .pane_id = pane_id } });
+}
+
 pub fn deinit(self: *Termio) void {
+    // Before anything else: stop the router calling back into us, wait
+    // out anything already running, and let every pane know its session
+    // is gone. Our threads are already joined by this point, so we hold
+    // no locks, and the mailbox this may use is still alive.
+    if (comptime StreamHandler.tmux_enabled) {
+        if (self.terminal_stream.handler.tmux_router) |r| r.detachHost();
+    }
+
     self.backend.deinit();
     self.terminal.deinit(self.alloc);
     self.config.deinit();
@@ -497,6 +583,23 @@ pub fn resize(
         // If we have size reporting enabled we need to send a report.
         if (self.terminal.modes.get(.in_band_size_reports)) {
             try self.sizeReportLocked(td, .mode_2048);
+        }
+
+        // Tell tmux how big our control mode client is. Without this it
+        // sizes the session to its smallest attached client, which may
+        // not be us.
+        if (comptime StreamHandler.tmux_enabled) tmux: {
+            const viewer = self.terminal_stream.handler.tmux_viewer orelse
+                break :tmux;
+
+            for (viewer.next(.{ .client_size = .{
+                .cols = grid_size.columns,
+                .rows = grid_size.rows,
+            } })) |action| switch (action) {
+                // We are on the io thread, so writing directly is fine.
+                .command => |cmd| try self.queueWrite(td, cmd, false),
+                else => {},
+            };
         }
     }
 
