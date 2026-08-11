@@ -408,6 +408,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .selectPane = tmuxHostSelectPane,
     .zoomPane = tmuxHostZoomPane,
     .moveWindow = tmuxHostMoveWindow,
+    .renameWindow = tmuxHostRenameWindow,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -468,6 +469,18 @@ fn tmuxHostKillWindows(
     self.tmuxHostInput(.{ .kill_windows = .{
         .pane_id = pane_id,
         .scope = scope,
+    } });
+}
+
+fn tmuxHostRenameWindow(
+    ctx: *anyopaque,
+    pane_id: usize,
+    name: []const u8,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .rename_window = .{
+        .pane_id = pane_id,
+        .name = name,
     } });
 }
 

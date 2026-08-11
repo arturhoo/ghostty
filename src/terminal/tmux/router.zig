@@ -120,6 +120,14 @@ pub const Router = struct {
                 pane_id: usize,
                 amount: isize,
             ) void,
+
+            /// The user asked to rename this pane's window. The name is
+            /// borrowed for the duration of the call.
+            renameWindow: *const fn (
+                ctx: *anyopaque,
+                pane_id: usize,
+                name: []const u8,
+            ) void,
         };
     };
 
@@ -431,6 +439,14 @@ pub const Router = struct {
         self.host.vtable.newWindow(self.host.ctx);
     }
 
+    /// Ask the session to rename this pane's window.
+    pub fn renameWindow(self: *Router, pane_id: usize, name: []const u8) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.renameWindow(self.host.ctx, pane_id, name);
+    }
+
     /// Ask the session to move this pane's window.
     pub fn moveWindow(self: *Router, pane_id: usize, amount: isize) void {
         if (!self.paneOpen(pane_id)) return;
@@ -565,6 +581,7 @@ const TestHost = struct {
         pane_id: usize,
         amount: isize,
     }) = .empty,
+    renames: std.ArrayList([]u8) = .empty,
     splits: std.ArrayList(struct {
         pane_id: usize,
         horizontal: bool,
@@ -585,6 +602,7 @@ const TestHost = struct {
         .selectPane = selectPane,
         .zoomPane = zoomPane,
         .moveWindow = moveWindow,
+        .renameWindow = renameWindow,
     };
 
     fn killWindows(
@@ -619,6 +637,13 @@ const TestHost = struct {
         self.zoomed_panes.append(self.alloc, pane_id) catch @panic("oom");
     }
 
+    fn renameWindow(ctx: *anyopaque, pane_id: usize, name: []const u8) void {
+        _ = pane_id;
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        const copy = self.alloc.dupe(u8, name) catch @panic("oom");
+        self.renames.append(self.alloc, copy) catch @panic("oom");
+    }
+
     fn moveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         self.window_moves.append(self.alloc, .{
@@ -649,6 +674,8 @@ const TestHost = struct {
         self.selected_panes.deinit(self.alloc);
         self.zoomed_panes.deinit(self.alloc);
         self.window_moves.deinit(self.alloc);
+        for (self.renames.items) |r| self.alloc.free(r);
+        self.renames.deinit(self.alloc);
     }
 
     fn write(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
