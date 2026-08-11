@@ -73,6 +73,10 @@ pub fn build(b: *std.Build) !void {
         "test-valgrind",
         "Run tests under valgrind",
     );
+    const test_tmux_live_step = b.step(
+        "test-tmux-live",
+        "Run tests that drive a real tmux server (needs tmux)",
+    );
     const translations_step = b.step(
         "update-translations",
         "Update translation files",
@@ -371,6 +375,17 @@ pub fn build(b: *std.Build) !void {
 
         // Normal tests always test our libghostty modules
         //test_step.dependOn(test_lib_vt_step);
+
+        // The tmux integration tests spawn a real tmux server and wait on
+        // it, so they are gated behind an environment variable rather than
+        // a build option: the same test binary runs either way, so asking
+        // for them costs no rebuild. This is a superset of `test`; narrow
+        // it with -Dtest-filter=live if that matters.
+        const tmux_live_run = b.addRunArtifact(test_exe);
+        tmux_live_run.setEnvironmentVariable("GHOSTTY_TMUX_LIVE", "1");
+        tmux_live_run.has_side_effects = true;
+        config.addPatchElf(test_exe, &tmux_live_run.step);
+        test_tmux_live_step.dependOn(&tmux_live_run.step);
 
         // Valgrind test running
         const valgrind_run = b.addSystemCommand(&.{
