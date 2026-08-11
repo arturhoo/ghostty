@@ -948,3 +948,55 @@ test "live: a paused pane is resumed and re-read" {
     try session.waitForPaneText(0, "resumed-ok");
     try testing.expect(!session.exited);
 }
+
+test "live: window names arrive and follow renames" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sleep 60");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // A name with spaces in it, because that is the case the format
+    // cannot handle by splitting: `list-windows` separates its fields
+    // with spaces, so the name has to be the rest of the line.
+    {
+        const out = try session.ask(&.{ "rename-window", "my long name" });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.windows.items.len > 0 and
+                std.mem.eql(u8, v.viewer.windows.items[0].name, "my long name");
+        }
+    }.pred);
+
+    // And a name arriving through `list-windows` rather than through the
+    // rename notification, which is the other half of the plumbing: a new
+    // window forces a re-list.
+    {
+        const out = try session.ask(&.{
+            "new-window", "-d", "-n", "second window", "sleep 60",
+        });
+        alloc.free(out);
+    }
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            if (v.viewer.windows.items.len != 2) return false;
+            if (!v.viewer.command_queue.empty()) return false;
+            for (v.viewer.windows.items) |w| {
+                if (std.mem.eql(u8, w.name, "second window")) return true;
+            }
+            return false;
+        }
+    }.pred);
+
+    // The first window kept its name across the re-list.
+    var found = false;
+    for (session.viewer.windows.items) |w| {
+        if (std.mem.eql(u8, w.name, "my long name")) found = true;
+    }
+    try testing.expect(found);
+    try testing.expect(!session.exited);
+}

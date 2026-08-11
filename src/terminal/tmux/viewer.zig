@@ -293,6 +293,20 @@ pub const Viewer = struct {
 
     pub const Window = struct {
         id: usize,
+
+        /// The window's tmux name, owned by the viewer's allocator.
+        ///
+        /// Deliberately *not* in `layout_arena`: whatever a GUI shows for
+        /// this window -- a tab label, a title bar -- is this, and it
+        /// crosses the C ABI as a pointer the GUI reads later, so it has
+        /// to outlive the layout it arrived with. The arena is reset
+        /// wholesale on every layout change, which a name living in it
+        /// does not survive.
+        ///
+        /// Updated in place by `%window-renamed` rather than costing a
+        /// round trip to `list-windows`.
+        name: []const u8,
+
         width: usize,
         height: usize,
         layout_arena: ArenaAllocator.State,
@@ -308,6 +322,7 @@ pub const Viewer = struct {
         } = null,
 
         pub fn deinit(self: *Window, alloc: Allocator) void {
+            alloc.free(self.name);
             self.layout_arena.promote(alloc).deinit();
         }
     };
@@ -1183,6 +1198,10 @@ pub const Viewer = struct {
                 return self.defunct();
             },
 
+            // Our session was renamed. Nothing shows the session name,
+            // so there is nothing to do but not treat it as unknown.
+            .session_renamed => {},
+
             // The active pane changed. We don't care about this because
             // we handle our own focus.
             .window_pane_changed => {},
@@ -1194,7 +1213,15 @@ pub const Viewer = struct {
             .sessions_changed => {},
 
             // We don't use window names for anything, currently.
-            .window_renamed => {},
+            // Update the name in place rather than re-listing: a rename
+            // changes nothing else, and a round trip per keystroke of
+            // someone's rename prompt would be absurd.
+            .window_renamed => |info| self.windowRenamed(
+                info.id,
+                info.name,
+            ) catch {
+                log.warn("failed to record a window rename", .{});
+            },
 
             // This is for other clients, which we don't do anything about.
             // For us, we'll get `exit` or `session_changed`, respectively.
@@ -1319,6 +1346,22 @@ pub const Viewer = struct {
             .{ .pane_visible = .{ .id = pane_id, .screen_key = .alternate } },
             .pane_state,
         });
+    }
+
+    /// Record a window's new name.
+    fn windowRenamed(self: *Viewer, window_id: usize, name: []const u8) !void {
+        const window: *Window = for (self.windows.items) |*w| {
+            if (w.id == window_id) break w;
+        } else {
+            log.info("rename for unknown window id={}", .{window_id});
+            return;
+        };
+
+        // Allocated before the old one is released, so a failure here
+        // leaves the window with the name it already had.
+        const copy = try self.alloc.dupe(u8, name);
+        self.alloc.free(window.name);
+        window.name = copy;
     }
 
     /// A window we were showing is gone.
@@ -1577,6 +1620,12 @@ pub const Viewer = struct {
         var windows: std.ArrayList(Window) = .empty;
         defer windows.deinit(self.alloc);
 
+        // Only on the error path: on success `syncLayouts` copies these
+        // structs into `self.windows` and takes their memory with them.
+        // It cannot fail after that copy -- see the `comptime unreachable`
+        // there -- so this never runs against windows we have handed off.
+        errdefer for (windows.items) |*w| w.deinit(self.alloc);
+
         // Parse all our windows
         var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |line_raw| {
@@ -1606,8 +1655,12 @@ pub const Viewer = struct {
                 return err;
             };
 
+            const name = try self.alloc.dupe(u8, data.window_name);
+            errdefer self.alloc.free(name);
+
             try windows.append(self.alloc, .{
                 .id = data.window_id,
+                .name = name,
                 .width = data.window_width,
                 .height = data.window_height,
                 .layout_arena = arena.state,
@@ -2166,6 +2219,9 @@ const Format = struct {
             .window_width,
             .window_height,
             .window_layout,
+            // Last on purpose: a window name can contain spaces, so it
+            // is parsed as the rest of the line.
+            .window_name,
         },
     };
 
@@ -4064,6 +4120,91 @@ test "a paused pane is resumed and re-read" {
             .check = (struct {
                 fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
                     try testing.expectEqual(6, v.command_queue.len());
+                }
+            }).check,
+        },
+    });
+}
+
+test "a layout change keeps the window name" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .window_renamed = .{
+            .id = 0,
+            .name = long_window_name,
+        } } } },
+
+        // A split, so the new layout allocates more than the old one did
+        // and would land on top of a name stored in the same arena.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = two_panes_vertical,
+                .visible_layout = two_panes_vertical,
+                .raw_flags = "*",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    // The name is what the GUI puts in a tab label and a
+                    // title bar, and it crosses the C ABI as a pointer, so
+                    // it has to outlive the layout it arrived with.
+                    try testing.expectEqualStrings(
+                        long_window_name,
+                        v.windows.items[0].name,
+                    );
+                }
+            }).check,
+        },
+    });
+}
+
+/// Long enough that a layout parsed into the same arena is certain to
+/// land on top of it, rather than happening to stop short.
+const long_window_name = "a" ** 512;
+
+test "a window rename does not cost a round trip" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        // Drain the pane_state reply so the queue is empty.
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .window_renamed = .{
+                .id = 0,
+                .name = "a new name",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings(
+                        "a new name",
+                        v.windows.items[0].name,
+                    );
+
+                    // Nothing asked, nothing queued: the notification
+                    // already carried everything a rename changes.
+                    try testing.expectEqual(0, actions.len);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+        // A rename for a window we do not have is not a reason to die.
+        .{
+            .input = .{ .tmux = .{ .window_renamed = .{
+                .id = 9,
+                .name = "nobody",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqualStrings(
+                        "a new name",
+                        v.windows.items[0].name,
+                    );
                 }
             }).check,
         },
