@@ -824,7 +824,16 @@ extension TerminalWindow: TabTitleEditorDelegate {
         for targetWindow: NSWindow
     ) {
         guard let targetController = targetWindow.windowController as? BaseTerminalController else { return }
-        targetController.titleOverride = editedTitle.isEmpty ? nil : editedTitle
+
+        // Through the core, like the title prompt. See the comment there:
+        // the core is the only place that can decide a title means
+        // something other than a local override.
+        guard targetController.focusedSurface?.surfaceModel?.perform(
+            action: "set_tab_title:\(editedTitle)") ?? false
+        else {
+            targetController.titleOverride = editedTitle.isEmpty ? nil : editedTitle
+            return
+        }
     }
 
     func tabTitleEditor(

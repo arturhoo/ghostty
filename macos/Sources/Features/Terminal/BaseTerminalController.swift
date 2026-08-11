@@ -437,10 +437,20 @@ class BaseTerminalController: NSWindowController,
             guard response == .alertFirstButtonReturn else { return }
 
             let newTitle = textField.stringValue
-            if newTitle.isEmpty {
-                self.titleOverride = nil
-            } else {
-                self.titleOverride = newTitle
+
+            // Through the core rather than straight onto the override.
+            // The action lands back here as `set_tab_title`, so the
+            // result is the same, but it gives the core the one thing it
+            // did not have: the title the user chose. An empty string
+            // clears the override, exactly as before.
+            //
+            // Falling back to setting it directly keeps a window with no
+            // focused surface behaving as it did.
+            guard self.focusedSurface?.surfaceModel?.perform(
+                action: "set_tab_title:\(newTitle)") ?? false
+            else {
+                self.titleOverride = newTitle.isEmpty ? nil : newTitle
+                return
             }
         }
     }
