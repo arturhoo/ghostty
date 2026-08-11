@@ -12,6 +12,12 @@ extension Ghostty.Action {
         /// is the root of the tree.
         struct Window {
             let id: Int
+
+            /// The window's tmux name. Copied out of the C payload like
+            /// everything else here, since that payload dies with the
+            /// action callback.
+            let name: String
+
             let width: Int
             let height: Int
             let nodes: [Node]
@@ -93,6 +99,7 @@ extension Ghostty.Action {
 
                 return Window(
                     id: cWindow.id,
+                    name: cWindow.name.map { String(cString: $0) } ?? "",
                     width: cWindow.width,
                     height: cWindow.height,
                     nodes: nodes)
