@@ -170,6 +170,7 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
+    tmux_pause_after: u32,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -205,6 +206,7 @@ pub const DerivedConfig = struct {
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+            .tmux_pause_after = config.@"tmux-pause-after",
             .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
