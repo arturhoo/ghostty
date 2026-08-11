@@ -1125,18 +1125,34 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .close => self.close(),
 
-        .tmux_windows => |set| tmux: {
+        .tmux_windows => |windows| tmux: {
             if (comptime !terminal.options.tmux_control_mode) break :tmux;
 
             // The action payload is only valid for the duration of the
             // call, which is why we can hand out the snapshot's memory
             // directly and free it as soon as we return.
-            defer set.destroy();
+            defer windows.set.destroy();
+
+            // Nothing to say if a newer snapshot is already queued behind
+            // this one. tmux sends the whole window list every time, so
+            // the newest holds everything the older ones did and no state
+            // is lost by skipping them.
+            //
+            // Skipping matters rather than merely saving work. The GUI
+            // answers a layout by resizing its panes, and a resize is
+            // reported back to tmux -- so applying a layout tmux has
+            // already moved on from asks tmux to return to it. With two
+            // snapshots in the queue that becomes a loop with no end: the
+            // GUI is always one behind, and each side keeps putting the
+            // other back. It shows up as two panes trading a column or a
+            // row between them for as long as the window is being
+            // dragged.
+            if (windows.seq != self.io.tmux_windows_seq.load(.monotonic)) break :tmux;
 
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .tmux_windows,
-                .{ .windows = set.windows },
+                .{ .windows = windows.set.windows },
             );
         },
 

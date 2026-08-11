@@ -559,7 +559,21 @@ pub const StreamHandler = struct {
                                 break :windows;
                             };
 
-                            self.surfaceMessageWriter(.{ .tmux_windows = set });
+                            // Stamped after the snapshot is built, so a
+                            // failed create above cannot burn a number and
+                            // leave the surface waiting for one that never
+                            // arrives. Every number handed out here is
+                            // delivered: surfaceMessageWriter waits for
+                            // room rather than dropping.
+                            const seq = self.tmux_host.tmux_windows_seq.fetchAdd(
+                                1,
+                                .monotonic,
+                            ) + 1;
+
+                            self.surfaceMessageWriter(.{ .tmux_windows = .{
+                                .set = set,
+                                .seq = seq,
+                            } });
                         },
                     }
                 }
