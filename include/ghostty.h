@@ -1179,6 +1179,13 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 // with ghostty_tmux_router_free, or hand it to exactly one surface
 // config, which consumes it.
 GHOSTTY_API void* ghostty_surface_tmux_router(ghostty_surface_t);
+// Close the tmux window this surface's pane is in, if it is one.
+//
+// Returns true if the kill was sent, in which case tmux owns the close
+// and the caller must NOT also close the tab locally -- it goes away
+// when tmux stops listing the window. Returns false for anything that
+// is not a tmux pane (the session host included); close it as usual.
+GHOSTTY_API bool ghostty_surface_tmux_close_tab(ghostty_surface_t);
 GHOSTTY_API void ghostty_tmux_router_free(void*);
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,

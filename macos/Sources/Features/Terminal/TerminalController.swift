@@ -751,7 +751,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             if let controller = window.windowController as? TerminalController {
                 // We must not register a redo, because it messes with our own redo
                 // that we register later.
-                controller.closeTabImmediately(registerRedo: false)
+                if !controller.closeTabViaTmux() {
+                    controller.closeTabImmediately(registerRedo: false)
+                }
             }
         }
 
@@ -794,7 +796,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         for (_, candidate) in tabsToClose {
             if let controller = candidate.windowController as? TerminalController {
-                controller.closeTabImmediately(registerRedo: false)
+                if !controller.closeTabViaTmux() {
+                    controller.closeTabImmediately(registerRedo: false)
+                }
             }
         }
 
@@ -817,6 +821,50 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 }
             }
         }
+    }
+
+    /// Ask tmux to close this tab's window, if the tab is showing tmux panes.
+    ///
+    /// AppKit's own close paths -- Cmd+W, the Close Tab menu item, the
+    /// window and tab close buttons -- never reach the core, so nothing
+    /// tells tmux the tab is gone. Closing such a tab locally does not
+    /// work: tmux is still listing the window, so the next notification
+    /// builds a fresh tab for it and the tab appears to close and
+    /// immediately come back.
+    ///
+    /// Returns true if tmux was asked. The caller must then do *nothing*
+    /// else: the tab goes away when tmux stops listing the window, and
+    /// closing it here as well recreates the very race being avoided.
+    ///
+    /// Probes this controller's own tree rather than `focusedSurface`,
+    /// which belongs to the key window -- during `windowShouldClose` on a
+    /// background tab, or while iterating other controllers, it is
+    /// somebody else's surface or nil.
+    private func closeTabViaTmux() -> Bool {
+        guard let surface = surfaceTree.first(where: { $0.surface != nil })?.surface
+        else { return false }
+        return ghostty_surface_tmux_close_tab(surface)
+    }
+
+    /// Close a window, or hand its tmux tabs to tmux.
+    ///
+    /// A tab group can hold both kinds at once, so this is decided per
+    /// tab rather than per window. A group with no tmux tabs takes the
+    /// unchanged window-level path, undo and all.
+    private func closeWindowViaTmuxOrImmediately() {
+        let windows: [NSWindow] = window?.tabGroup?.windows ?? [window].compactMap { $0 }
+        let controllers = windows.compactMap { $0.windowController as? TerminalController }
+        let locals = controllers.filter { !$0.closeTabViaTmux() }
+
+        // Nothing was tmux, so this is exactly what it always was.
+        guard locals.count < controllers.count else {
+            closeWindowImmediately()
+            return
+        }
+
+        // The window itself goes when its last tab does: closeTabImmediately
+        // falls through to closeWindowImmediately once it is alone.
+        for controller in locals { controller.closeTabImmediately() }
     }
 
     /// Closes the current window (including any other tabs) immediately and without
@@ -1300,7 +1348,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
-            closeTabImmediately()
+            if !closeTabViaTmux() { closeTabImmediately() }
             return
         }
 
@@ -1308,7 +1356,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             messageText: "Close Tab?",
             informativeText: "The terminal still has a running process. If you close the tab the process will be killed."
         ) {
-            self.closeTabImmediately()
+            if !self.closeTabViaTmux() { self.closeTabImmediately() }
         }
     }
 
@@ -1389,7 +1437,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             .compactMap({ $0.windowController as? TerminalController })
             .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
         else {
-            closeWindowImmediately()
+            closeWindowViaTmuxOrImmediately()
             return
         }
 
@@ -1399,7 +1447,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             messageText: "Close Window?",
             informativeText: "All terminal sessions in this window will be terminated.",
         ) {
-            self.closeWindowImmediately()
+            self.closeWindowViaTmuxOrImmediately()
         }
     }
 

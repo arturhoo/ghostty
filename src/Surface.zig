@@ -2137,7 +2137,14 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
 /// app runtime reaches the router without it having to travel through an
 /// action payload and the C ABI.
 /// Ask tmux to close windows, if this surface is a tmux pane.
-fn tmuxCloseTab(
+/// Ask tmux to close windows, if this surface is a tmux pane.
+///
+/// Public because the embedded apprt calls it for closes that originate
+/// in AppKit rather than in a binding: macOS's Cmd+W and its window and
+/// tab close buttons never reach `performBindingAction`, and a tmux tab
+/// torn down locally comes straight back -- tmux is still listing the
+/// window, so the next notification rebuilds a tab for it.
+pub fn tmuxCloseTab(
     self: *Surface,
     scope: terminal.tmux.Viewer.Input.KillWindows.Scope,
 ) bool {
