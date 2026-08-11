@@ -41,6 +41,19 @@ pub const PaneStateData = viewer.PaneStateData;
 /// Slices are only valid for the duration of the sink call: they point into
 /// the viewer's notification and arena memory, the same contract the viewer's
 /// actions carry. Copy anything you need to keep.
+/// Which windows a "close tab" applies to.
+///
+/// Lives here rather than on the viewer's input because the router
+/// carries it and cannot import the viewer without a cycle.
+pub const KillScope = enum {
+    /// Just the window the surface is in.
+    this,
+    /// Every window except that one.
+    others,
+    /// Every window after it, in tmux's order.
+    right,
+};
+
 pub const Op = union(enum) {
     /// Raw VT bytes: `%output` data, or capture-pane replay content.
     ///

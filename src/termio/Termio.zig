@@ -401,6 +401,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .kill = tmuxHostKill,
     .newWindow = tmuxHostNewWindow,
     .split = tmuxHostSplit,
+    .killWindows = tmuxHostKillWindows,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -449,6 +450,18 @@ fn tmuxHostResize(
         .pane_id = pane_id,
         .cols = cols,
         .rows = rows,
+    } });
+}
+
+fn tmuxHostKillWindows(
+    ctx: *anyopaque,
+    pane_id: usize,
+    scope: terminalpkg.tmux.sink.KillScope,
+) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .kill_windows = .{
+        .pane_id = pane_id,
+        .scope = scope,
     } });
 }
 
