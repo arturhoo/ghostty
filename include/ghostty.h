@@ -934,6 +934,12 @@ typedef struct {
   const char* name;
   size_t width;
   size_t height;
+  // Whether a pane is zoomed, and which. `zoomed_pane_id` means nothing
+  // unless `zoomed` is set. A GUI should render only that pane, filling
+  // the window; every other pane in `nodes` still exists and must be
+  // kept alive.
+  bool zoomed;
+  size_t zoomed_pane_id;
   const ghostty_tmux_node_s* nodes;
   size_t nodes_len;
 } ghostty_tmux_window_s;
