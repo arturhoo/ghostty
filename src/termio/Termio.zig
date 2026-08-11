@@ -407,6 +407,7 @@ pub const tmux_host_vtable: terminalpkg.tmux.Router.Host.VTable = .{
     .detach = tmuxHostDetach,
     .selectPane = tmuxHostSelectPane,
     .zoomPane = tmuxHostZoomPane,
+    .moveWindow = tmuxHostMoveWindow,
 };
 
 /// Feed one input to the viewer and send whatever command it produces.
@@ -467,6 +468,14 @@ fn tmuxHostKillWindows(
     self.tmuxHostInput(.{ .kill_windows = .{
         .pane_id = pane_id,
         .scope = scope,
+    } });
+}
+
+fn tmuxHostMoveWindow(ctx: *anyopaque, pane_id: usize, amount: isize) void {
+    const self: *Termio = @ptrCast(@alignCast(ctx));
+    self.tmuxHostInput(.{ .move_window = .{
+        .pane_id = pane_id,
+        .amount = amount,
     } });
 }
 
