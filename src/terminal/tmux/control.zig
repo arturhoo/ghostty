@@ -46,6 +46,10 @@ pub const Parser = struct {
 
         /// Inside a begin/end block.
         block,
+
+        /// Discarding a line that could not have been a notification.
+        /// See the `.idle` arm of `put` for how we get here.
+        skip_line,
     };
 
     pub fn deinit(self: *Parser) void {
@@ -77,16 +81,24 @@ pub const Parser = struct {
             // Drop because we're in a broken state.
             .broken => return null,
 
-            // Waiting for a notification so if the byte is not '%' then
-            // we're in a broken state. Control mode output should always
-            // be wrapped in '%begin/%end' orelse we expect a notification.
-            // Return an exit notification.
-            .idle => if (byte != '%') {
-                self.broken();
-                return .{ .exit = {} };
-            } else {
+            // Every line tmux sends should begin with '%'. One that does
+            // not is the tail of the line before it: tmux does not escape
+            // names or command output, and both can contain a newline, so
+            // `rename-window $'a\nb'` is enough to produce one. Ending
+            // the session over that is a very large consequence for a very
+            // small provocation, so drop the line instead.
+            .idle => if (byte == '%') {
                 self.buffer.clearRetainingCapacity();
                 self.state = .notification;
+            } else if (byte != '\n') {
+                self.buffer.clearRetainingCapacity();
+                self.state = .skip_line;
+            },
+
+            // Discarding a line we could not have understood.
+            .skip_line => if (byte == '\n') {
+                log.warn("discarded a stray control mode line", .{});
+                self.state = .idle;
             },
 
             // If we're in a notification and its not a newline then
@@ -322,6 +334,18 @@ pub const Parser = struct {
                 .visible_layout = visible_layout,
                 .raw_flags = raw_flags,
             } };
+        } else if (std.mem.eql(u8, cmd, "%exit")) {
+            // `%exit`, or `%exit <reason>`. tmux follows this with the
+            // string terminator that ends the DCS, so the viewer would
+            // find out either way; this is how it finds out *why*.
+            const reason: ?[]const u8 = if (line.len > cmd.len + 1)
+                line[cmd.len + 1 ..]
+            else
+                null;
+
+            // Important: do not clear the buffer, reason points into it.
+            self.state = .idle;
+            return .{ .exit = reason };
         } else if (std.mem.eql(u8, cmd, "%window-add")) cmd: {
             var re = oni.Regex.init(
                 "^%window-add @([0-9]+)$",
@@ -620,14 +644,14 @@ pub const Notification = union(enum) {
     /// tmux control mode is starting.
     enter,
 
-    /// Exit.
+    /// Control mode ended.
     ///
-    /// NOTE: The tmux protocol contains a "reason" string (human friendly)
-    /// associated with this. We currently drop it because we don't need it
-    /// but this may be something we want to add later. If we do add it,
-    /// we have to consider buffer limits and how we handle those (dropping
-    /// vs truncating, etc.).
-    exit,
+    /// Carries tmux's reason when it gave one. Nothing acts on it, but it
+    /// is the only explanation we ever get for a session ending, and
+    /// "too far behind" reads very differently from a clean detach when
+    /// something has gone wrong. It points into the parser's buffer and
+    /// so is bounded by `max_bytes` like every other line.
+    exit: ?[]const u8,
 
     /// Dispatched at the end of a begin/end block with the raw data.
     /// The control mode parser can't parse the data because it is unaware
@@ -990,6 +1014,55 @@ test "tmux window-add" {
     const n = (try c.put('\n')).?;
     try testing.expect(n == .window_add);
     try testing.expectEqual(14, n.window_add.id);
+}
+
+test "tmux exit without a reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+    for ("%exit") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expect(n == .exit);
+    try testing.expectEqual(null, n.exit);
+}
+
+test "tmux exit with a reason" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // The reason tmux gives when it decides a control client is not
+    // draining fast enough, and the only explanation we would ever get.
+    for ("%exit too far behind") |byte| try testing.expect(try c.put(byte) == null);
+    const n = (try c.put('\n')).?;
+    try testing.expectEqualStrings("too far behind", n.exit.?);
+}
+
+test "tmux survives a name containing a newline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Parser = .{ .buffer = .init(alloc) };
+    defer c.deinit();
+
+    // `rename-window $'a\nb'` is enough to produce this. tmux does not
+    // escape names, so the tail arrives as its own line starting with a
+    // byte that cannot begin a notification.
+    for ("%window-renamed @1 a") |byte| try testing.expect(try c.put(byte) == null);
+    const renamed = (try c.put('\n')).?;
+    try testing.expectEqualStrings("a", renamed.window_renamed.name);
+
+    for ("b") |byte| try testing.expect(try c.put(byte) == null);
+    try testing.expect(try c.put('\n') == null);
+
+    // Still alive, and still parsing.
+    for ("%window-add @7") |byte| try testing.expect(try c.put(byte) == null);
+    const added = (try c.put('\n')).?;
+    try testing.expectEqual(7, added.window_add.id);
 }
 
 test "tmux window-close" {

@@ -809,3 +809,40 @@ test "live: killing a tmux window drops it here too" {
     }
     try testing.expect(!session.exited);
 }
+
+test "live: a stray line does not end the session" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "cat");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // Feed the malformed line straight into the chain rather than asking
+    // tmux to produce one.
+    //
+    // The obvious provocation -- `rename-window $'a\nb'`, since tmux
+    // accepts any valid UTF-8 as a name -- does not work: tmux 3.5a runs
+    // names through `utf8_stravis(VIS_OCTAL|VIS_CSTYLE)` in
+    // `window_set_name`, so the wire carries `%window-renamed @0 a\nb`
+    // with a literal backslash and 'n' on one line. A test written that
+    // way passes with the recovery removed, which is worse than no test.
+    //
+    // Whether any tmux can put a raw newline at the start of a line is
+    // not something we can prove from here, so the recovery stays as
+    // defence for input we did not anticipate -- and this checks that the
+    // defence works on the real chain, parser and viewer included.
+    for ("stray line with no percent\n") |byte| try session.feed(byte);
+
+    try testing.expect(!session.exited);
+
+    // Not merely un-exited: still working. A parser left in the broken
+    // state drops everything after it, so this would never arrive.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "survived\r",
+    } });
+    try session.waitForPaneText(0, "survived");
+    try testing.expect(!session.exited);
+}
