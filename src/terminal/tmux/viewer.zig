@@ -194,6 +194,10 @@ pub const Viewer = struct {
     /// The panes in the current session, mapped by pane ID.
     panes: PanesMap,
 
+    /// The pane we last told tmux the user was in. See `nextSelectPane`
+    /// for why a repeat is dropped rather than sent.
+    last_selected_pane: ?usize = null,
+
     /// The arena used for the prior action allocated state. This contains
     /// the contents for the actions as well as the actions slice itself.
     action_arena: ArenaAllocator.State,
@@ -275,6 +279,9 @@ pub const Viewer = struct {
         /// Leave the session, because the user asked to detach.
         detach: void,
 
+        /// Tell tmux the user moved into this pane.
+        select_pane: SelectPane,
+
         /// Ask tmux to split a pane, because the GUI asked for a split.
         split: Split,
 
@@ -322,6 +329,10 @@ pub const Viewer = struct {
             scope: Scope,
 
             pub const Scope = sinkpkg.KillScope;
+        };
+
+        pub const SelectPane = struct {
+            pane_id: usize,
         };
 
         pub const KillPane = struct {
@@ -498,6 +509,7 @@ pub const Viewer = struct {
             .command_queue = command_queue,
             .windows = .empty,
             .panes = .empty,
+            .last_selected_pane = null,
             .action_arena = .{},
             .action_single = undefined,
         };
@@ -539,6 +551,7 @@ pub const Viewer = struct {
             .client_size => self.nextClientSize(input.client_size),
             .new_window => self.nextNewWindow(),
             .detach => self.nextDetach(),
+            .select_pane => self.nextSelectPane(input.select_pane),
             .split => self.nextSplit(input.split),
             .kill_windows => self.nextKillWindows(input.kill_windows),
             .kill_pane => self.nextKillPane(input.kill_pane),
@@ -892,6 +905,39 @@ pub const Viewer = struct {
 
         return self.queueUserCommand("new-window\n", .{}) catch {
             log.warn("failed to queue new-window", .{});
+            return &.{};
+        };
+    }
+
+    /// Tell tmux which pane the user is in.
+    ///
+    /// `select-pane` moves the active pane within its window, which is
+    /// what focus means here. It is visible to every other client
+    /// attached to the session -- iTerm2 does the same thing from its own
+    /// focus changes, and the alternative is that tmux's idea of "the
+    /// active pane" has nothing to do with where the user is typing.
+    ///
+    /// Deduplicated, and that is not an optimisation. Focus can flap
+    /// several times in a drag or a window switch, only one command is
+    /// ever in flight, and everything else the user does queues behind
+    /// it -- including the `send-keys` carrying their keystrokes.
+    fn nextSelectPane(self: *Viewer, req: Input.SelectPane) []const Action {
+        if (self.state != .command_queue) return &.{};
+        if (!self.panes.contains(req.pane_id)) {
+            log.info("select of unknown pane id={}, dropping", .{req.pane_id});
+            return &.{};
+        }
+
+        if (self.last_selected_pane) |last| {
+            if (last == req.pane_id) return &.{};
+        }
+        self.last_selected_pane = req.pane_id;
+
+        return self.queueUserCommand(
+            "select-pane -t %{d}\n",
+            .{req.pane_id},
+        ) catch {
+            log.warn("failed to queue select-pane", .{});
             return &.{};
         };
     }
@@ -1616,6 +1662,13 @@ pub const Viewer = struct {
             // If we added any panes, then we also want to resync the pane
             // state (terminal modes and cursor positions and so on).
             if (added) try self.queueCommands(&.{.pane_state});
+
+            // A pane appearing or disappearing moves tmux's active pane,
+            // and we are not told where it went until inbound sync
+            // lands. Forget what we last selected rather than dedupe
+            // against something no longer true and leave the user
+            // focused here while tmux thinks they are elsewhere.
+            if (added or removed.items.len > 0) self.last_selected_pane = null;
         }
 
         // No more errors after this point. We're about to replace all
@@ -4148,6 +4201,93 @@ test "tmux resizing a pane forgets what we asked for" {
 
     try testing.expectEqual(30, pane.terminal.rows);
     try testing.expectEqual(null, pane.last_resize_request);
+}
+
+test "focusing a pane tells tmux, once" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testTwoPaneSteps(two_panes_vertical));
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .contains_command = "select-pane -t %1\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // Focus can flap several times in one drag or window switch, and
+        // only one command is in flight at a time, so a repeat would put
+        // latency on the user's own keystrokes for nothing.
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 1 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                }
+            }).check,
+        },
+
+        // A different pane is a different answer.
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 0 } },
+            .contains_command = "select-pane -t %0\n",
+        },
+    });
+}
+
+test "a pane we do not have is not selected" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 9 } },
+            .check = (struct {
+                fn check(v: *Viewer, actions: []const Viewer.Action) anyerror!void {
+                    for (actions) |action| try testing.expect(action != .command);
+                    try testing.expect(v.command_queue.empty());
+                    try testing.expectEqual(null, v.last_selected_pane);
+                }
+            }).check,
+        },
+    });
+}
+
+test "a layout change forgets which pane we selected" {
+    var viewer = try Viewer.init(testing.io, testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, testSinglePaneSteps());
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .select_pane = .{ .pane_id = 0 } },
+            .contains_command = "select-pane -t %0\n",
+        },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+
+        // A split moves tmux's active pane to the new one, and nothing
+        // tells us so until inbound sync lands. Deduping against a pane
+        // tmux no longer considers active would leave the user focused
+        // here while tmux thinks they are in the new pane.
+        .{
+            .input = .{ .tmux = .{ .layout_change = .{
+                .window_id = 0,
+                .layout = two_panes_vertical,
+                .visible_layout = two_panes_vertical,
+                .raw_flags = "*",
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    try testing.expectEqual(null, v.last_selected_pane);
+                }
+            }).check,
+        },
+    });
 }
 
 test "detaching asks tmux to detach this client" {

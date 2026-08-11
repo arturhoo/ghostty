@@ -106,6 +106,9 @@ pub const Router = struct {
             /// The user asked to leave the session, without killing
             /// anything in it.
             detach: *const fn (ctx: *anyopaque) void,
+
+            /// The user moved into this pane.
+            selectPane: *const fn (ctx: *anyopaque, pane_id: usize) void,
         };
     };
 
@@ -417,6 +420,14 @@ pub const Router = struct {
         self.host.vtable.newWindow(self.host.ctx);
     }
 
+    /// Tell the session the user has moved into this pane.
+    pub fn selectPane(self: *Router, pane_id: usize) void {
+        if (!self.paneOpen(pane_id)) return;
+        if (!self.hostAcquire()) return;
+        defer self.hostRelease();
+        self.host.vtable.selectPane(self.host.ctx, pane_id);
+    }
+
     /// Leave the session, leaving everything in it running.
     ///
     /// Not tied to a pane, and deliberately the whole session: detaching
@@ -521,6 +532,7 @@ const TestHost = struct {
     kills: std.ArrayList(usize) = .empty,
     new_windows: usize = 0,
     detaches: usize = 0,
+    selected_panes: std.ArrayList(usize) = .empty,
     splits: std.ArrayList(struct {
         pane_id: usize,
         horizontal: bool,
@@ -538,6 +550,7 @@ const TestHost = struct {
         .split = split,
         .killWindows = killWindows,
         .detach = detach,
+        .selectPane = selectPane,
     };
 
     fn killWindows(
@@ -562,6 +575,11 @@ const TestHost = struct {
         self.detaches += 1;
     }
 
+    fn selectPane(ctx: *anyopaque, pane_id: usize) void {
+        const self: *TestHost = @ptrCast(@alignCast(ctx));
+        self.selected_panes.append(self.alloc, pane_id) catch @panic("oom");
+    }
+
     fn split(ctx: *anyopaque, pane_id: usize, horizontal: bool) void {
         const self: *TestHost = @ptrCast(@alignCast(ctx));
         self.splits.append(self.alloc, .{
@@ -581,6 +599,7 @@ const TestHost = struct {
         self.kills.deinit(self.alloc);
         self.splits.deinit(self.alloc);
         self.window_kills.deinit(self.alloc);
+        self.selected_panes.deinit(self.alloc);
     }
 
     fn write(ctx: *anyopaque, pane_id: usize, data: []const u8) void {
