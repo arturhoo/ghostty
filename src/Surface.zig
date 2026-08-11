@@ -2162,6 +2162,16 @@ fn tmuxNewWindow(self: *Surface) bool {
     return true;
 }
 
+/// Ask tmux to toggle zoom on this pane, if this surface is one.
+fn tmuxZoom(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.zoomPane(pane.id);
+    return true;
+}
+
 /// Leave the tmux session this surface belongs to, if it belongs to one.
 ///
 /// The pane is only how we reach the session; detaching is not about it.
@@ -5582,11 +5592,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .toggle_split_zoom => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .toggle_split_zoom,
-            {},
-        ),
+        .toggle_split_zoom => {
+            // On a tmux pane, zoom belongs to tmux: it is what every
+            // other client attached to the session sees, and it is what
+            // comes back in the next layout. Toggling here as well would
+            // show a zoom tmux had not agreed to.
+            if (self.tmuxZoom()) return true;
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .toggle_split_zoom,
+                {},
+            );
+        },
 
         .toggle_readonly => {
             self.readonly = !self.readonly;
