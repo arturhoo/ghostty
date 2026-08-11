@@ -96,6 +96,10 @@ const Session = struct {
     /// have to free every one of them.
     scratch: [64]u8 = undefined,
 
+    /// How many `%pause` notifications tmux has sent us. A test that
+    /// means to provoke one should check that it did.
+    pauses: usize = 0,
+
     /// Start a server running `command` in its one pane, then attach.
     ///
     /// The session is created detached first so that `command` has already
@@ -279,6 +283,7 @@ const Session = struct {
         // the session struct, so entering is a no-op and exiting is just
         // recorded.
         switch (n) {
+            .pause => self.pauses += 1,
             .enter => return,
             .exit => {
                 self.exited = true;
@@ -844,5 +849,102 @@ test "live: a stray line does not end the session" {
         .data = "survived\r",
     } });
     try session.waitForPaneText(0, "survived");
+    try testing.expect(!session.exited);
+}
+
+test "live: a paused pane is resumed and re-read" {
+    if (!enabled()) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var session = try Session.start(alloc, testing.io, 80, 24, "sh");
+    defer session.deinit();
+
+    try session.waitFor(attached);
+
+    // Put something on screen first. It has to still be there afterwards:
+    // the recovery re-reads the pane, and a re-read that dropped the
+    // scrollback would be its own bug.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "echo before-pause\r",
+    } });
+    try session.waitForPaneText(0, "before-pause");
+
+    // Pause the pane outright rather than provoking tmux's own
+    // pause-after timer. Falling behind on purpose does reach the same
+    // code, but whether tmux decides we are late enough is a race, and it
+    // fired about half the time. `control_pause_pane` is the same
+    // function the timer calls (cmd-refresh-client.c), so this exercises
+    // the identical path with none of the timing.
+    //
+    // We never enable pause-after ourselves; this is here because any
+    // other client can, and a paused pane is indistinguishable from a
+    // frozen one.
+    {
+        const clients = try session.ask(&.{
+            "list-clients", "-F", "#{client_name}",
+        });
+        defer alloc.free(clients);
+        const name = std.mem.trim(u8, clients, " \r\n");
+
+        const out = try session.ask(&.{
+            "refresh-client", "-t", name, "-A", "%0:pause",
+        });
+        alloc.free(out);
+    }
+
+    // While the pane is paused, make it print something. tmux discards a
+    // paused pane's output rather than buffering it, so this can only
+    // ever reach us through a capture -- which makes it the thing that
+    // tells a real recovery apart from a bare resume. Sent through the
+    // tmux CLI rather than the viewer so it does not queue behind the
+    // recovery commands.
+    {
+        const out = try session.ask(&.{
+            "send-keys", "-t", "%0", "echo during-pause", "Enter",
+        });
+        alloc.free(out);
+    }
+
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.pauses > 0;
+        }
+    }.pred);
+
+    // The recovery is a resume plus a full re-read of the pane, because
+    // tmux discards a paused pane's output rather than buffering it. It
+    // has landed once the queue drains.
+    try session.waitFor(struct {
+        fn pred(v: *Session) bool {
+            return v.viewer.command_queue.empty();
+        }
+    }.pred);
+
+    try testing.expect(!session.exited);
+    try testing.expect(session.viewer.panes.contains(0));
+
+    // The re-read half of the recovery. What the pane printed while it
+    // was paused never came to us as %output -- tmux threw it away -- so
+    // it is on screen only if we read the pane again afterwards. A
+    // recovery that merely resumed would leave a permanent hole here.
+    try session.waitForPaneText(0, "during-pause");
+
+    // And the re-read did not cost us what was already there.
+    {
+        const text = try session.paneText(0);
+        defer alloc.free(text);
+        try testing.expect(
+            std.mem.indexOf(u8, text, "before-pause") != null,
+        );
+    }
+
+    // Output reaches us again, which it would not if the pane were still
+    // paused: tmux would be dropping it server side.
+    try session.input(.{ .write = .{
+        .pane_id = 0,
+        .data = "echo resumed-ok\r",
+    } });
+    try session.waitForPaneText(0, "resumed-ok");
     try testing.expect(!session.exited);
 }
