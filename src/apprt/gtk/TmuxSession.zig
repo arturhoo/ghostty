@@ -15,6 +15,7 @@ const TmuxSession = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+const adw = @import("adw");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
@@ -108,6 +109,36 @@ pub fn sync(
 
     self.pruneWindows(&live_windows);
     self.prunePanes(&live_panes);
+    self.selectActiveWindow(windows);
+}
+
+/// Bring forward the tab for the window tmux is currently on.
+///
+/// tmux tracks a current window per session and it moves when anyone
+/// moves it -- another client, a script, a binding typed in a pane. When
+/// that happens for a reason that did not come from here, the tab on
+/// screen and the window tmux believes the user is on have come apart,
+/// and tmux is the one that is right.
+///
+/// Selecting the page that is already selected is not free, so it is
+/// checked first.
+fn selectActiveWindow(self: *TmuxSession, windows: []const WindowSet.Window) void {
+    const active = for (windows) |window| {
+        if (window.active) break window;
+    } else return;
+
+    const ref = self.windows.getPtr(active.id) orelse return;
+    const tab = ref.get() orelse return;
+    defer tab.unref();
+
+    const tab_view = ext.getAncestor(
+        adw.TabView,
+        tab.as(gtk.Widget),
+    ) orelse return;
+
+    const page = tab_view.getPage(tab.as(gtk.Widget));
+    if (tab_view.getSelectedPage() == page) return;
+    tab_view.setSelectedPage(page);
 }
 
 fn syncWindow(

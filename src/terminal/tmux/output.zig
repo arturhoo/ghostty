@@ -166,6 +166,8 @@ pub const Variable = enum {
     /// Window name. Any valid UTF-8, spaces included, so this must be the
     /// last variable in a format: see `parseFormatStruct`.
     window_name,
+    /// Whether this window is the session's current one.
+    window_active,
     /// Width of window.
     window_width,
     /// Height of window.
@@ -197,6 +199,7 @@ pub const Variable = enum {
             .mouse_standard_flag,
             .mouse_utf8_flag,
             .origin_flag,
+            .window_active,
             .wrap_flag,
             => std.mem.eql(u8, value, "1"),
             .alternate_saved_x,
@@ -233,6 +236,7 @@ pub const Variable = enum {
     /// The type of the parsed value for this variable type.
     pub fn Type(comptime self: Variable) type {
         return switch (self) {
+            .window_active,
             .alternate_on,
             .bracketed_paste,
             .cursor_blinking,
