@@ -64,6 +64,7 @@ class TmuxWindowManager {
         guard let hostSurface = hostView.surface else { return }
 
         let host = ObjectIdentifier(hostView)
+        let panesBefore = Set(panes.keys)
         var liveWindows: Set<Key> = []
         var livePanes: Set<Key> = []
 
@@ -103,6 +104,7 @@ class TmuxWindowManager {
                     keepFocusInWindow(window, of: controller, host: host)
                 }
                 setTitle(controller, window.name)
+                focusNewPane(in: window, of: controller, host: host, seen: panesBefore)
                 continue
             }
 
@@ -226,6 +228,33 @@ class TmuxWindowManager {
         guard let window = windows[Key(host: host, id: id)]?.value?.window,
               window.isVisible else { return nil }
         return window
+    }
+
+    /// Move focus to a pane that has just appeared in a window that was
+    /// already on screen.
+    ///
+    /// That is what a split is from here: tmux answers `split-window`
+    /// with a layout, and the pane arrives with everything else. A local
+    /// split leaves the new surface focused, so this one should too.
+    ///
+    /// Only when the window is the key one. tmux tells every client about
+    /// every change, so without that a split someone else made in another
+    /// window would pull the user out of what they were typing into.
+    private func focusNewPane(
+        in window: Ghostty.Action.TmuxWindows.Window,
+        of controller: TerminalController,
+        host: ObjectIdentifier,
+        seen: Set<Key>
+    ) {
+        guard controller.window?.isKeyWindow ?? false else { return }
+
+        for node in window.nodes where node.kind == .pane {
+            let key = Key(host: host, id: node.paneId)
+            guard !seen.contains(key) else { continue }
+            guard let view = panes[key]?.value else { continue }
+            controller.focusSurface(view)
+            return
+        }
     }
 
     /// Show the tmux window's name as the window title.

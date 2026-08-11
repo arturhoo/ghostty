@@ -2131,6 +2131,53 @@ pub fn selectionString(self: *Surface, alloc: Allocator) !?[:0]const u8 {
 /// The caller gets its own reference and must `unref` it. This is how the
 /// app runtime reaches the router without it having to travel through an
 /// action payload and the C ABI.
+/// Ask tmux for a new window, if this surface is a tmux pane.
+///
+/// Returns false for an ordinary surface, which is the caller's signal to
+/// do the local thing instead.
+fn tmuxNewWindow(self: *Surface) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.newWindow();
+    return true;
+}
+
+/// Ask tmux to split this pane, if this surface is one.
+fn tmuxSplit(
+    self: *Surface,
+    direction: terminal.tmux.Viewer.Input.Split.Direction,
+) bool {
+    if (comptime !terminal.options.tmux_control_mode) return false;
+
+    const pane = self.tmuxPane() orelse return false;
+    defer pane.router.unref();
+    pane.router.splitPane(pane.id, direction == .right);
+    return true;
+}
+
+/// The tmux pane this surface displays, if it displays one.
+///
+/// A surface hosting a control mode session is not a pane: it has a
+/// router but no pane id, and a new tab from there is an ordinary new
+/// tab. Only surfaces that *are* panes route their verbs to tmux.
+fn tmuxPane(self: *Surface) ?struct {
+    router: *terminal.tmux.Router,
+    id: usize,
+} {
+    if (comptime !terminal.options.tmux_control_mode) return null;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const tmux = switch (self.io.backend) {
+        .tmux => |*v| v,
+        else => return null,
+    };
+    return .{ .router = tmux.router.ref(), .id = tmux.pane_id };
+}
+
 pub fn tmuxRouter(self: *Surface) ?*terminal.tmux.Router {
     if (comptime !terminal.options.tmux_control_mode) return null;
 
@@ -5370,11 +5417,19 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
-        .new_tab => return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_tab,
-            {},
-        ),
+        .new_tab => {
+            // On a tmux pane, a new tab is a new tmux window: the point
+            // of attaching to a session is that what you open belongs to
+            // it, not to this machine. tmux answers with %window-add and
+            // the window materializes through the normal path.
+            if (self.tmuxNewWindow()) return true;
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_tab,
+                {},
+            );
+        },
 
         .close_tab => |v| return try self.rt_app.performAction(
             .{ .surface = self },
@@ -5414,20 +5469,34 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {},
         ),
 
-        .new_split => |direction| return try self.rt_app.performAction(
-            .{ .surface = self },
-            .new_split,
-            switch (direction) {
-                .right => .right,
-                .left => .left,
-                .down => .down,
-                .up => .up,
+        .new_split => |direction| {
+            // Same reasoning as new_tab. "auto" is resolved here rather
+            // than in the viewer, because which way is bigger is a
+            // property of this surface, which tmux cannot see.
+            if (self.tmuxSplit(switch (direction) {
+                .right, .left => .right,
+                .down, .up => .down,
                 .auto => if (self.size.screen.width > self.size.screen.height)
                     .right
                 else
                     .down,
-            },
-        ),
+            })) return true;
+
+            return try self.rt_app.performAction(
+                .{ .surface = self },
+                .new_split,
+                switch (direction) {
+                    .right => .right,
+                    .left => .left,
+                    .down => .down,
+                    .up => .up,
+                    .auto => if (self.size.screen.width > self.size.screen.height)
+                        .right
+                    else
+                        .down,
+                },
+            );
+        },
 
         .goto_split => |direction| return try self.rt_app.performAction(
             .{ .surface = self },
