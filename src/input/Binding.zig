@@ -600,6 +600,17 @@ pub const Action = union(enum) {
     /// found by running `ghostty +version`.
     toggle_tab_overview,
 
+    /// Detach from the tmux control mode session this surface belongs to.
+    ///
+    /// The session and everything running in it keeps running; only this
+    /// client leaves. Every window the session was showing closes, the
+    /// same as when a session ends for any other reason.
+    ///
+    /// Does nothing on a surface that is not a tmux pane. Unbound by
+    /// default, because closing a tmux pane's tab kills the tmux window
+    /// and there has to be a way to say the other thing.
+    tmux_detach,
+
     /// Change the title of the current focused surface via a pop-up prompt.
     prompt_surface_title,
 
@@ -1374,6 +1385,7 @@ pub const Action = union(enum) {
             .decrease_font_size,
             .reset_font_size,
             .set_font_size,
+            .tmux_detach,
             .prompt_surface_title,
             .prompt_tab_title,
             .set_surface_title,
